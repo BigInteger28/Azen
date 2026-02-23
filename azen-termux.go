@@ -1452,7 +1452,7 @@ type Config struct {
 }
 
 func DefaultConfig(numPlayers int) Config {
-	w, _ := LoadWeights("weights.json")
+	w, _ := LoadWeights("storage/shared/Documents/weights.json")
 	return Config{
 		Iterations:   5000,
 		MaxTime:      0,
@@ -2965,3 +2965,4 @@ var _ = EvaluateHand
 var _ = QuickEvaluateMove
 var _ = ShouldPass
 var _ = gatherSpecials
+
