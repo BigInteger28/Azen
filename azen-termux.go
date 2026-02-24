@@ -1590,25 +1590,41 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 				hasNormal = true
 			}
 		}
-		if hasAce || !hasWild {
-			filtered = append(filtered, m) // Aas of naturelle zet: altijd bewaren
+		// Oversized combo filter ("/" zetten met meer kaarten dan de tabelgrootte).
+		// Voorbeeld: tafel = XX (2 kaarten), naturelle KK beschikbaar, maar engine speelt
+		// "01/55" (4 kaarten: joker+aas+5+5). De joker+aas is verspilling als KK volstaat.
+		// Regel: filter oversized special combos als een naturelle zet de tafel al verslaat.
+		// Uitzondering: als geen naturelle zet bestaat (maxNaturalRank == 0 of ≤ tableRank),
+		// dan is de oversized combo soms de enige optie → bewaren.
+		if len(m.Cards) > round.Count && (hasWild || hasAce) && maxNaturalRank > tableRank {
+			continue // gefilterd: naturelle zet is efficiënter dan deze "/" combo
+		}
+		if !hasWild {
+			filtered = append(filtered, m) // Naturelle zet (geen wildcards): altijd bewaren
 			continue
 		}
-		// Puur-wild (bijv. 2+joker, twee wildcards): effectieve rank = tableRank.
-		// Een naturelle zet bereikt ALTIJD een hogere rank én spaart de wildcard.
-		// → gedomineerd als naturelle zetten beschikbaar zijn (maxNaturalRank > 0,
-		//   al gecontroleerd bovenaan). Alleen bewaren als er geen naturellen zijn.
-		if !hasNormal {
+		// Vanaf hier: zet bevat minstens één wildcard.
+
+		// Puur-wild (geen aas, geen normaal — bijv. joker+joker, 2+2):
+		// een naturelle zet verslaat de tafel en spaart alle wildcards → filter.
+		if !hasNormal && !hasAce {
 			continue // gefilterd: puur-wild gedomineerd door naturelle zetten
 		}
-		// Wild+normal: alleen bewaren als de effectieve rank voldoende hoger is dan
-		// alle naturelle opties. Bij hoge naturelle ranks (≥10) is een 1-rank voordeel
-		// te klein: de wildcard-kost weegt niet op tegen het minimale voordeel.
-		// Eis daarom 2+ rank voordeel zodra maxNaturalRank ≥ RankTen.
-		// Voorbeeld: K+wild (13) vs QQ (12, ≥10) → threshold=13, 13>13=false → gefilterd ✓
-		//            K+wild (13) vs JJ (11, ≥10) → threshold=12, 13>12=true  → bewaard  ✓
-		//            Q+wild (12) vs JJ (11, ≥10) → threshold=12, 12>12=false → gefilterd ✓
-		//            Q+wild (12) vs TT (10, ≥10) → threshold=11, 12>11=true  → bewaard  ✓
+		// Wild+aas (bijv. "2 1", "0 1") EN wild+normaal (bijv. "K 2", "Q 0"):
+		// beide gebruiken een wildcard. Alleen bewaren als de effectieve rank
+		// voldoende hoger is dan alle naturelle opties.
+		// Bij hoge naturelle ranks (≥10) is een 1-rank voordeel te klein:
+		// de wildcard-kost weegt niet op tegen het minimale voordeel.
+		// Eis 2+ rank voordeel zodra maxNaturalRank ≥ RankTen.
+		//
+		// Voorbeeld wild+aas "0 1" (rank 14) vs KK (rank 13, ≥10):
+		//   threshold=14, 14>14=false → gefilterd ✓ (KK volstaat!)
+		// Voorbeeld wild+aas "0 1" (rank 14) vs JJ (rank 11, ≥10):
+		//   threshold=12, 14>12=true  → bewaard  ✓ (3-rank voordeel)
+		// Voorbeeld wild+normaal "K 2" (rank 13) vs QQ (rank 12, ≥10):
+		//   threshold=13, 13>13=false → gefilterd ✓
+		// Voorbeeld wild+normaal "K 2" (rank 13) vs JJ (rank 11, ≥10):
+		//   threshold=12, 13>12=true  → bewaard  ✓
 		er := m.EffectiveRank(tableRank)
 		threshold := maxNaturalRank
 		if maxNaturalRank >= RankTen {
@@ -1715,9 +1731,15 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		}
 	}
 	bestMove := moveMap[bestKey]
-	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat en er speelbare zetten zijn
+	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat of als 2-speler eindspel.
+	// 2-speler: tegenstander krijgt vrije open ronde → kan alles in 1 zet wegspelen.
+	// Drempel gebaseerd op tegenstander's kaarten: < 9 = dodelijk gebied.
 	myID := gs.CurrentTurn
-	if bestMove.IsPass && gs.Hands[myID].Count()-minOppHandCount(gs, myID) >= 4 {
+	myCards := gs.Hands[myID].Count()
+	oppCards := minOppHandCount(gs, myID)
+	shouldOverridePass := bestMove.IsPass && (myCards-oppCards >= 4 ||
+		(activePlayerCount(gs) <= 2 && oppCards < 9))
+	if shouldOverridePass {
 		bestNonPassKey := ""
 		bestNonPassWR := -1.0
 		for k, m := range moveMap {
@@ -1779,8 +1801,12 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 		e.backprop(node, result, myID)
 	}
 	bestMove, eval := e.pickBest(root, myID)
-	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat en er speelbare zetten zijn
-	if bestMove.IsPass && gs.Hands[myID].Count()-minOppHandCount(gs, myID) >= 4 {
+	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat of als 2-speler eindspel.
+	// Drempel gebaseerd op tegenstander's kaarten: < 9 = dodelijk gebied.
+	myCards2 := gs.Hands[myID].Count()
+	oppCards2 := minOppHandCount(gs, myID)
+	if bestMove.IsPass && (myCards2-oppCards2 >= 4 ||
+		(activePlayerCount(gs) <= 2 && oppCards2 < 9)) {
 		if m, ok := bestNonPassFromDetails(eval.Details); ok {
 			for _, d := range eval.Details {
 				if MovesEqual(d.Move, m) {
@@ -2022,6 +2048,21 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		}
 	}
 
+	// 2-speler eindspel: PASS is bijna altijd catastrofaal.
+	// Tegenstander krijgt een vrije open ronde en kan zijn hele hand in één zet wegspelen.
+	// Drempel: tegenstander heeft < 9 kaarten = dodelijk gebied (7 kaarten = 1 zet gewonnen).
+	if minOpp < 9 {
+		activePlayers := 0
+		for i, h := range gs.Hands {
+			if !gs.Finished[i] && h.Count() > 0 {
+				activePlayers++
+			}
+		}
+		if activePlayers <= 2 {
+			passChance *= 0.25 // 75% minder pasgedrag in 2-speler eindspel
+		}
+	}
+
 	if e.rng.Float64() < passChance {
 		return pass
 	}
@@ -2244,6 +2285,17 @@ func minOppHandCount(gs *GameState, myID int) int {
 		return 0
 	}
 	return min
+}
+
+// activePlayerCount telt het aantal spelers dat nog actief is (niet gefinished, nog kaarten).
+func activePlayerCount(gs *GameState) int {
+	count := 0
+	for i := range gs.Hands {
+		if !gs.Finished[i] && gs.Hands[i].Count() > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // bestNonPassFromDetails geeft de non-pass zet met de hoogste win-rate uit MCTS-details.
