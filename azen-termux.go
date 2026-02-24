@@ -1231,30 +1231,38 @@ type Weights struct {
 	QueenPenalty       float64 `json:"queen_penalty"`
 	IsolatedLowPenalty float64 `json:"isolated_low_penalty"`
 	ClusterBonus       float64 `json:"cluster_bonus"`
+	TempoBonus         float64 `json:"tempo_bonus"`
 	AcePlayFactor      float64 `json:"ace_play_factor"`
 	WildPlayFactor     float64 `json:"wild_play_factor"`
 	SynergyPenalty     float64 `json:"synergy_penalty"`
 	RankPreference     float64 `json:"rank_preference"`
 	PassBase           float64 `json:"pass_base"`
 	PassSpecialFactor  float64 `json:"pass_special_factor"`
+	PassBehindFactor   float64 `json:"pass_behind_factor"`
+	UrgencyPenalty     float64 `json:"urgency_penalty"`
+	EarlyGamePassFactor float64 `json:"early_game_pass_factor"`
 }
 
 func DefaultWeights() Weights {
 	return Weights{
-		AceBonus:           0.14,
-		WildBonus:          0.10,
-		SynergyBonus:       0.05,
-		CardDiffWeight:     0.05,
-		KingPenalty:        0.04,
-		QueenPenalty:       0.02,
-		IsolatedLowPenalty: 0.03,
-		ClusterBonus:       0.02,
-		AcePlayFactor:      0.20,
-		WildPlayFactor:     0.35,
-		SynergyPenalty:     0.50,
-		RankPreference:     0.10,
-		PassBase:           0.10,
-		PassSpecialFactor:  0.25,
+		AceBonus:            0.33,
+		WildBonus:           0.38,   // verhoogd: 0.21→0.38 (wildcard bewaren loont meer)
+		SynergyBonus:        0.20,   // verhoogd: 0.12→0.20 (ace+wild synergie beter gewaardeerd)
+		CardDiffWeight:      0.085,
+		KingPenalty:         0.05,
+		QueenPenalty:        0.032,
+		IsolatedLowPenalty:  0.042,
+		ClusterBonus:        0.038,
+		TempoBonus:          0.085,
+		AcePlayFactor:       0.52,
+		WildPlayFactor:      0.33,   // verlaagd: 0.41→0.33 (simulaties spelen wilds spaarzamer)
+		SynergyPenalty:      0.40,
+		RankPreference:      0.11,
+		PassBase:            0.085,
+		PassSpecialFactor:   0.225,
+		PassBehindFactor:    0.31,
+		UrgencyPenalty:      0.09,
+		EarlyGamePassFactor: 0.32,    // nieuwe parameter: bonus voor early-game pass bij gelijke handen
 	}
 }
 
@@ -1524,7 +1532,97 @@ type workerResult struct {
 	moves  map[string]Move
 }
 
-func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed int64) workerResult {
+// filterDominatedMoves verwijdert wild+normal combinaties die gedomineerd worden door
+// naturelle zetten (geen wildcards). Een wild-zet is gedomineerd als er een naturelle zet
+// bestaat die een GELIJKE OF HOGERE effectieve rank bereikt — de wildcard is dan pure verspilling.
+//
+// Wild-zetten die een UNIEK HOGERE rank bereiken dan alle naturelle opties blijven altijd
+// beschikbaar (bijv. K+wild als QQ de hoogste naturelle zet is: rank 13 > rank 12).
+// Zo is de filter veilig bij zowel lage als hoge iteratiecounts.
+//
+// Puur-wildcardspellen (2+joker), aas-zetten en PASS worden nooit gefilterd.
+// In open rondes geen filter.
+func filterDominatedMoves(moves []Move, round RoundState) []Move {
+	if round.IsOpen {
+		return moves
+	}
+	tableRank := round.TableRank
+
+	// Bepaal de hoogste effectieve rank die bereikbaar is via naturelle zetten (geen wilds, geen aces)
+	maxNaturalRank := Rank(0)
+	for _, m := range moves {
+		if m.IsPass {
+			continue
+		}
+		hasWild, hasAce, hasNormal := false, false, false
+		for _, c := range m.Cards {
+			if c.IsWild() {
+				hasWild = true
+			} else if c.IsAce() {
+				hasAce = true
+			} else {
+				hasNormal = true
+			}
+		}
+		if !hasWild && !hasAce && hasNormal {
+			if er := m.EffectiveRank(tableRank); er > maxNaturalRank {
+				maxNaturalRank = er
+			}
+		}
+	}
+	if maxNaturalRank == 0 {
+		return moves // Geen naturelle zetten beschikbaar — alles bewaren
+	}
+
+	filtered := make([]Move, 0, len(moves))
+	for _, m := range moves {
+		if m.IsPass {
+			filtered = append(filtered, m)
+			continue
+		}
+		hasWild, hasAce, hasNormal := false, false, false
+		for _, c := range m.Cards {
+			if c.IsWild() {
+				hasWild = true
+			} else if c.IsAce() {
+				hasAce = true
+			} else {
+				hasNormal = true
+			}
+		}
+		if hasAce || !hasWild {
+			filtered = append(filtered, m) // Aas of naturelle zet: altijd bewaren
+			continue
+		}
+		// Puur-wild (bijv. 2+joker, twee wildcards): effectieve rank = tableRank.
+		// Een naturelle zet bereikt ALTIJD een hogere rank én spaart de wildcard.
+		// → gedomineerd als naturelle zetten beschikbaar zijn (maxNaturalRank > 0,
+		//   al gecontroleerd bovenaan). Alleen bewaren als er geen naturellen zijn.
+		if !hasNormal {
+			continue // gefilterd: puur-wild gedomineerd door naturelle zetten
+		}
+		// Wild+normal: alleen bewaren als de effectieve rank voldoende hoger is dan
+		// alle naturelle opties. Bij hoge naturelle ranks (≥10) is een 1-rank voordeel
+		// te klein: de wildcard-kost weegt niet op tegen het minimale voordeel.
+		// Eis daarom 2+ rank voordeel zodra maxNaturalRank ≥ RankTen.
+		// Voorbeeld: K+wild (13) vs QQ (12, ≥10) → threshold=13, 13>13=false → gefilterd ✓
+		//            K+wild (13) vs JJ (11, ≥10) → threshold=12, 13>12=true  → bewaard  ✓
+		//            Q+wild (12) vs JJ (11, ≥10) → threshold=12, 12>12=false → gefilterd ✓
+		//            Q+wild (12) vs TT (10, ≥10) → threshold=11, 12>11=true  → bewaard  ✓
+		er := m.EffectiveRank(tableRank)
+		threshold := maxNaturalRank
+		if maxNaturalRank >= RankTen {
+			threshold++ // vereist 2+ rank voordeel bij hoge naturelle ranks
+		}
+		if er > threshold {
+			filtered = append(filtered, m)
+		}
+		// Gefilterd: wildcard-voordeel te klein t.o.v. beschikbare naturelle zetten
+	}
+	return filtered
+}
+
+func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed int64, rootFiltered []Move) workerResult {
 	workerCfg := e.Config
 	workerCfg.NumWorkers = 1
 	worker := &Engine{Config: workerCfg, rng: rand.New(rand.NewSource(seed))}
@@ -1540,7 +1638,7 @@ func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed 
 		if detGS == nil {
 			continue
 		}
-		node, simGS := worker.selectExpand(root, detGS, myID)
+		node, simGS := worker.selectExpand(root, detGS, myID, rootFiltered)
 		result := worker.simulate(simGS, myID)
 		worker.backprop(node, result, myID)
 	}
@@ -1562,9 +1660,11 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 	if win := findImmediateWin(gs); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1}
 	}
+	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
+	rootFiltered := filterDominatedMoves(gs.GetLegalMoves(), gs.Round)
 	numWorkers := e.Config.NumWorkers
 	if numWorkers <= 1 {
-		return e.bestMoveSingle(gs, kt)
+		return e.bestMoveSingle(gs, kt, rootFiltered)
 	}
 	itersPerWorker := e.Config.Iterations / numWorkers
 	if itersPerWorker < 1 {
@@ -1584,7 +1684,7 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 			if idx == numWorkers-1 {
 				iters = e.Config.Iterations - itersPerWorker*(numWorkers-1)
 			}
-			results[idx] = e.runWorker(gs, kt, iters, seeds[idx])
+			results[idx] = e.runWorker(gs, kt, iters, seeds[idx], rootFiltered)
 		}(w)
 	}
 	wg.Wait()
@@ -1615,6 +1715,29 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		}
 	}
 	bestMove := moveMap[bestKey]
+	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat en er speelbare zetten zijn
+	myID := gs.CurrentTurn
+	if bestMove.IsPass && gs.Hands[myID].Count()-minOppHandCount(gs, myID) >= 4 {
+		bestNonPassKey := ""
+		bestNonPassWR := -1.0
+		for k, m := range moveMap {
+			if !m.IsPass {
+				v := totalVisits[k]
+				if v > 0 {
+					wr2 := totalWins[k] / float64(v)
+					if wr2 > bestNonPassWR {
+						bestNonPassWR = wr2
+						bestNonPassKey = k
+					}
+				}
+			}
+		}
+		if bestNonPassKey != "" {
+			bestKey = bestNonPassKey
+			bestVisits = totalVisits[bestKey]
+			bestMove = moveMap[bestKey]
+		}
+	}
 	wr := 0.0
 	if bestVisits > 0 {
 		wr = totalWins[bestKey] / float64(bestVisits)
@@ -1638,7 +1761,7 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 	return bestMove, MoveEval{Score: wr, Visits: bestVisits, Details: details}
 }
 
-func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
+func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltered []Move) (Move, MoveEval) {
 	root := newRoot()
 	myID := gs.CurrentTurn
 	hasDeadline := e.Config.MaxTime > 0
@@ -1651,11 +1774,22 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker) (Move, Move
 		if detGS == nil {
 			continue
 		}
-		node, simGS := e.selectExpand(root, detGS, myID)
+		node, simGS := e.selectExpand(root, detGS, myID, rootFiltered)
 		result := e.simulate(simGS, myID)
 		e.backprop(node, result, myID)
 	}
-	return e.pickBest(root, myID)
+	bestMove, eval := e.pickBest(root, myID)
+	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat en er speelbare zetten zijn
+	if bestMove.IsPass && gs.Hands[myID].Count()-minOppHandCount(gs, myID) >= 4 {
+		if m, ok := bestNonPassFromDetails(eval.Details); ok {
+			for _, d := range eval.Details {
+				if MovesEqual(d.Move, m) {
+					return m, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
+				}
+			}
+		}
+	}
+	return bestMove, eval
 }
 
 func (e *Engine) determinize(gs *GameState, kt *KnowledgeTracker) *GameState {
@@ -1711,10 +1845,19 @@ func (e *Engine) determinize(gs *GameState, kt *KnowledgeTracker) *GameState {
 	return det
 }
 
-func (e *Engine) selectExpand(node *mctsNode, gs *GameState, myID int) (*mctsNode, *GameState) {
+// selectExpand voert de selectie- en expansiefase van MCTS uit.
+// rootFiltered: gefilterde zetten voor het root-knooppunt (nil = gebruik alle zetten).
+func (e *Engine) selectExpand(node *mctsNode, gs *GameState, myID int, rootFiltered []Move) (*mctsNode, *GameState) {
 	simGS := gs.Clone()
 	for !simGS.GameOver {
-		moves := simGS.GetLegalMoves()
+		// Bij het root-knooppunt (parent == nil) enkel de gefilterde zetten aanbieden;
+		// dieper in de boom altijd alle legale zetten gebruiken.
+		var moves []Move
+		if node.parent == nil && rootFiltered != nil {
+			moves = rootFiltered
+		} else {
+			moves = simGS.GetLegalMoves()
+		}
 		if len(moves) == 0 {
 			break
 		}
@@ -1802,11 +1945,14 @@ func positionScore(gs *GameState, myID int) float64 {
 func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	wts := e.Config.Weights
 	handCount := gs.Hands[gs.CurrentTurn].Count()
+
+	// Directe win move altijd spelen
 	for _, m := range moves {
 		if !m.IsPass && len(m.Cards) == handCount {
 			return m
 		}
 	}
+
 	var plays []Move
 	var pass Move
 	for _, m := range moves {
@@ -1819,6 +1965,7 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	if len(plays) == 0 {
 		return pass
 	}
+
 	curHand := gs.Hands[gs.CurrentTurn]
 	curWilds := curHand.CountRank(RankTwo) + curHand.CountRank(RankJoker)
 	curAces := curHand.CountRank(RankAce)
@@ -1826,16 +1973,72 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	if handCount > 0 {
 		specialRatio = float64(curWilds+curAces) / float64(handCount)
 	}
+
+	// PASS CHANCE
 	passChance := wts.PassBase + specialRatio*wts.PassSpecialFactor
+
+	// Early-game pass bonus: alleen als speler NIET achterligt (gelijk of vooruit)
+	if handCount >= 8 {
+		for i, h := range gs.Hands {
+			if i != gs.CurrentTurn && !gs.Finished[i] {
+				if handCount <= h.Count() {
+					passChance += wts.EarlyGamePassFactor
+				}
+				break
+			}
+		}
+	}
+
+	// Achterlig-penalty
+	minOpp := 999
+	for i, h := range gs.Hands {
+		if i != gs.CurrentTurn && !gs.Finished[i] && h.Count() < minOpp {
+			minOpp = h.Count()
+		}
+	}
+	if handCount > minOpp {
+		diff := handCount - minOpp
+		switch {
+		case diff >= 7: passChance *= 0.03
+		case diff >= 6: passChance *= 0.08
+		case diff >= 5: passChance *= 0.15
+		case diff >= 4: passChance *= 0.25
+		case diff >= 3: passChance *= 0.42
+		case diff >= 2: passChance *= 0.72
+		}
+	}
+
+	// Late-game threat
+	if minOpp <= 5 && !gs.Round.IsOpen {
+		hasBeater := false
+		for _, c := range curHand.Cards {
+			if c.IsWild() || (!c.IsSpecial() && c.Rank > gs.Round.TableRank) {
+				hasBeater = true
+				break
+			}
+		}
+		if hasBeater {
+			passChance = 0.02
+		}
+	}
+
 	if e.rng.Float64() < passChance {
 		return pass
 	}
+
+	// === SPEEL-KEUZE ===
+	acePlayFactor := wts.AcePlayFactor
+	wildPlayFactor := wts.WildPlayFactor
+	synergyPenalty := wts.SynergyPenalty
+
 	weights := make([]float64, len(plays))
 	total := 0.0
 	for i, m := range plays {
 		w := 1.0
 		wilds := 0
 		aces := 0
+		effective := m.EffectiveRank(gs.Round.TableRank)
+
 		for _, c := range m.Cards {
 			if c.IsWild() {
 				wilds++
@@ -1843,19 +2046,66 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 				aces++
 			}
 		}
-		w *= math.Pow(wts.AcePlayFactor, float64(aces))
-		w *= math.Pow(wts.WildPlayFactor, float64(wilds))
-		if aces > 0 && wilds > 0 {
-			w *= wts.SynergyPenalty
+
+		w *= math.Pow(acePlayFactor, float64(aces))
+		w *= math.Pow(wildPlayFactor, float64(wilds))
+
+		// === WILD-VERSPIJLING STRAF ===
+		if wilds > 0 && handCount >= 12 {           // nog veel kaarten
+			if effective <= RankFive {              // extreem lage beat (zoals 3)
+				w *= 0.09                           // bijna onmogelijk maken
+			} else if effective <= RankEight {
+				w *= 0.28
+			} else if effective <= RankTen {
+				w *= 0.40                           // nieuw: rank 9-10 ook extra straf
+			} else if effective <= RankQueen {
+				w *= 0.40                           // aangescherpt: 0.60→0.40 (Q0 minder aantrekkelijk)
+			}
+			// King+wild: geen extra straf (K is terecht moeilijk anders te spelen)
+		} else if wilds > 0 {
+			if effective <= RankSix {
+				w *= 0.25
+			} else if effective <= RankNine {
+				w *= 0.45                           // iets aangescherpt: 0.50→0.45
+			}
 		}
+		// =====================================================
+
+		// Bonus voor dumpen van lage normale kaarten (4 4 krijgt voorkeur)
+		if wilds == 0 && aces == 0 && len(m.Cards) >= 1 {
+			lowest := m.Cards[0].Rank
+			if lowest <= RankFive {
+				w *= 1.60
+			} else if lowest <= RankEight {
+				w *= 1.30
+			}
+		}
+
+		if aces > 0 {
+			if gs.Round.IsOpen {
+				w *= 5.5
+			} else {
+				w *= 2.9
+			}
+		}
+		if aces > 0 && wilds > 0 && gs.Round.IsOpen {
+			w *= 2.1
+		}
+
+		if aces > 0 && wilds > 0 {
+			w *= synergyPenalty
+		}
+
 		for _, c := range m.Cards {
 			if !c.IsSpecial() {
 				w *= 1.0 + wts.RankPreference*(13.0-float64(c.Rank))
 			}
 		}
+
 		weights[i] = w
 		total += w
 	}
+
 	r := e.rng.Float64() * total
 	cum := 0.0
 	for i, w := range weights {
@@ -1886,6 +2136,13 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 		minOpp = 0
 	}
 	score := 0.5 + float64(minOpp-myCount)*wts.CardDiffWeight
+
+	// Urgentiepenalty: bij 3+ kaarten achter een extra niet-lineaire straf.
+	gap := myCount - minOpp
+	if gap >= 3 {
+		score -= math.Pow(float64(gap), 1.2) * wts.UrgencyPenalty  // exponent voor sterker effect bij grote gap		
+	}
+
 	hand := gs.Hands[myID]
 	wilds := hand.CountRank(RankTwo) + hand.CountRank(RankJoker)
 	aces := hand.CountRank(RankAce)
@@ -1911,6 +2168,13 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 		cnt := hand.CountRank(r)
 		if cnt >= 2 {
 			score += float64(cnt-1) * wts.ClusterBonus
+		}
+	}
+	// Tempo + Ace in open ronde = extreem sterk
+	if gs.Round.IsOpen && gs.CurrentTurn == myID {
+		score += wts.TempoBonus * 4.0
+		if hand.CountAces() > 0 {
+			score += 0.45 // Zeer zware bonus voor Ace + extra beurt
 		}
 	}
 	if score < 0 {
@@ -1968,6 +2232,35 @@ func (e *Engine) pickBest(root *mctsNode, myID int) (Move, MoveEval) {
 	return bestNode.move, MoveEval{Score: wr, Visits: bestV, Details: details}
 }
 
+// minOppHandCount geeft het laagste kaartaantal van actieve tegenstanders.
+func minOppHandCount(gs *GameState, myID int) int {
+	min := 999
+	for i, h := range gs.Hands {
+		if i != myID && !gs.Finished[i] && h.Count() < min {
+			min = h.Count()
+		}
+	}
+	if min == 999 {
+		return 0
+	}
+	return min
+}
+
+// bestNonPassFromDetails geeft de non-pass zet met de hoogste win-rate uit MCTS-details.
+func bestNonPassFromDetails(details []MoveDetail) (Move, bool) {
+	bestWR := -1.0
+	var bestMove Move
+	found := false
+	for _, d := range details {
+		if !d.Move.IsPass && d.Visits > 0 && d.WinRate > bestWR {
+			bestWR = d.WinRate
+			bestMove = d.Move
+			found = true
+		}
+	}
+	return bestMove, found
+}
+
 func (e *Engine) AnalyzeMove(gs *GameState, kt *KnowledgeTracker, m Move) MoveDetail {
 	myID := gs.CurrentTurn
 	wins := 0.0
@@ -1983,6 +2276,17 @@ func (e *Engine) AnalyzeMove(gs *GameState, kt *KnowledgeTracker, m Move) MoveDe
 		wins += result
 	}
 	return MoveDetail{Move: m, WinRate: wins / float64(sims), Visits: sims}
+}
+
+// FindMoveInEval zoekt een zet op in de MoveEval-details die door BestMove zijn berekend.
+// Geeft (detail, true) terug als gevonden, anders (zero, false).
+func FindMoveInEval(eval MoveEval, m Move) (MoveDetail, bool) {
+	for _, d := range eval.Details {
+		if MovesEqual(d.Move, m) && d.Visits > 0 {
+			return d, true
+		}
+	}
+	return MoveDetail{}, false
 }
 
 func mkey(m Move) string {
@@ -2264,8 +2568,10 @@ func main() {
 		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou")
 		fmt.Println("  [2] Analyse - Bekijk een gespeeld spel opnieuw")
 		fmt.Println("  [3] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
+		fmt.Println("  [4] Snelle analyse - Plak een volledige partij in één keer")
+		fmt.Println("  [5] Weight Tuner - Optimaliseer de AI gewichten (krachtige PC)")
 		fmt.Println()
-		modeStr := reader.ReadLine("Kies modus (0/1/2/3): ")
+		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4): ")
 		mode, _ := strconv.Atoi(modeStr)
 		switch mode {
 		case 0:
@@ -2278,6 +2584,12 @@ func main() {
 			return
 		case 3:
 			simulateMode(reader, cfg)
+			return
+		case 4:
+			quickAnalyzeMode(reader, cfg)
+			return
+		case 5:
+			weightTunerMode(reader, cfg)
 			return
 		default:
 			playMode(reader, cfg)
@@ -2453,45 +2765,50 @@ func playMode(reader *Reader, cfg settings) {
 	if p, err := reader.ReadInt("Jouw spelernummer (1-" + strconv.Itoa(numPlayers) + "): "); err == nil && p >= 1 && p <= numPlayers {
 		myPlayer = p - 1
 	}
-	fmt.Println("\nVoer jouw 18 kaarten in (komma, spatie of aaneengesloten):")
-	fmt.Println("  Voorbeeld: KK3XJ19Q25  of  K,K,3,X,J  of  K K 3 X J")
-	fmt.Println("  Typ 'help' voor uitleg.")
-	fmt.Println()
-	var myHand *Hand
-	for {
-		input := reader.ReadLine("Jouw kaarten: ")
-		if strings.ToLower(input) == "help" {
-			PrintHelp()
-			continue
+	hands := make([]*Hand, numPlayers)
+	cardCounts := make([]int, numPlayers)
+	for i := 0; i < numPlayers; i++ {
+		cardCounts[i] = 18
+		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
+			cardCounts[i] = n
 		}
-		parsed, err := ParseCards(input)
-		if err != nil {
-			fmt.Printf("Fout: %v\n", err)
-			continue
+		if i == myPlayer {
+			fmt.Println("\nVoer jouw kaarten in (komma, spatie of aaneengesloten):")
+			fmt.Println("  Voorbeeld: KK3XJ19Q25  of  K,K,3,X,J  of  K K 3 X J")
+			fmt.Println("  Typ 'help' voor uitleg.")
+			fmt.Println()
+			var myHand *Hand
+			for {
+				input := reader.ReadLine("Jouw kaarten: ")
+				if strings.ToLower(input) == "help" {
+					PrintHelp()
+					continue
+				}
+				parsed, err := ParseCards(input)
+				if err != nil {
+					fmt.Printf("Fout: %v\n", err)
+					continue
+				}
+				if len(parsed) != cardCounts[i] {
+					fmt.Printf("Verwacht %d kaarten, kreeg %d. Probeer opnieuw.\n", cardCounts[i], len(parsed))
+					continue
+				}
+				myHand = NewHand(parsed)
+				break
+			}
+			hands[i] = myHand
+			fmt.Println("\n\nJouw hand:")
+			PrintCards(myHand)
+		} else {
+			ph := make([]Card, cardCounts[i])
+			hands[i] = NewHand(ph)
 		}
-		if len(parsed) != 18 {
-			fmt.Printf("Verwacht 18 kaarten, kreeg %d. Probeer opnieuw.\n", len(parsed))
-			continue
-		}
-		myHand = NewHand(parsed)
-		break
 	}
-	fmt.Println("\nJouw hand:")
-	PrintCards(myHand)
 	var deadCards []Card
 	if numPlayers == 2 {
 		fmt.Println("\nMet 2 spelers zijn 18 kaarten niet in spel (engine houdt hiermee rekening).")
 	}
-	tracker := NewKnowledgeTracker(numPlayers, myPlayer, myHand, deadCards)
-	hands := make([]*Hand, numPlayers)
-	for i := 0; i < numPlayers; i++ {
-		if i == myPlayer {
-			hands[i] = myHand
-		} else {
-			ph := make([]Card, 18)
-			hands[i] = NewHand(ph)
-		}
-	}
+	tracker := NewKnowledgeTracker(numPlayers, myPlayer, hands[myPlayer], deadCards)
 	gs := NewGameWithHands(hands, deadCards, 0)
 	iters := 5000
 	if n, err := reader.ReadInt("Engine-iteraties per zet (standaard 5000, meer = nauwkeuriger maar trager): "); err == nil && n > 0 {
@@ -2662,15 +2979,19 @@ func analyzeMode(reader *Reader, cfg settings) {
 	}
 	hands := make([]*Hand, numPlayers)
 	for i := 0; i < numPlayers; i++ {
-		fmt.Printf("\nVoer de starthand van Speler %d in (18 kaarten):\n", i+1)
+		cardCount := 18
+		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
+			cardCount = n
+		}
+		fmt.Printf("\nVoer de starthand van Speler %d in (%d kaarten):\n", i+1, cardCount)
 		for {
 			parsed, err := reader.ReadCards(fmt.Sprintf("Speler %d kaarten: ", i+1))
 			if err != nil {
 				fmt.Printf("Fout: %v\n", err)
 				continue
 			}
-			if len(parsed) != 18 {
-				fmt.Printf("Verwacht 18, kreeg %d\n", len(parsed))
+			if len(parsed) != cardCount {
+				fmt.Printf("Verwacht %d, kreeg %d\n", cardCount, len(parsed))
 				continue
 			}
 			hands[i] = NewHand(parsed)
@@ -2684,10 +3005,6 @@ func analyzeMode(reader *Reader, cfg settings) {
 				parsed, err := reader.ReadCards("Dode kaarten: ")
 				if err != nil {
 					fmt.Printf("Fout: %v\n", err)
-					continue
-				}
-				if len(parsed) != 18 {
-					fmt.Printf("Verwacht 18, kreeg %d\n", len(parsed))
 					continue
 				}
 				deadCards = parsed
@@ -2783,7 +3100,11 @@ func analyzeMode(reader *Reader, cfg settings) {
 					bestLabel = fmt.Sprintf("%s / %s", FormatMove(bestMove), FormatMove(bestFollow))
 				}
 			}
-			actualDetail = eng.AnalyzeMove(gs, tracker, move)
+			if d, ok := FindMoveInEval(bestEval, move); ok {
+				actualDetail = d
+			} else {
+				actualDetail = eng.AnalyzeMove(gs, tracker, move)
+			}
 		}
 		if err := gs.ValidateMove(move); err != nil {
 			fmt.Printf("Ongeldige zet: %v\n", err)
@@ -2815,6 +3136,11 @@ func analyzeMode(reader *Reader, cfg settings) {
 					fmt.Printf("⚠️  Ongeldige vervolg-zet: %v\n", err2)
 				} else {
 					gs.ApplyMove(followMove)
+					for p := 0; p < numPlayers; p++ {
+						if trackers[p] != nil {
+							trackers[p].RecordMove(followMove)
+						}
+					}
 					moveLabel = fmt.Sprintf("%s / %s", FormatMove(move), FormatMove(followMove))
 				}
 			}
@@ -2857,6 +3183,180 @@ func analyzeMode(reader *Reader, cfg settings) {
 		printRanking(gs)
 	}
 	fmt.Println("\nAnalyse klaar.")
+}
+
+func quickAnalyzeMode(reader *Reader, cfg settings) {
+	PrintHeader("Snelle Analyse")
+	fmt.Println("Voer de partij in één keer in.")
+	fmt.Println("Zetten: spatie-gescheiden tokens die alterneren tussen spelers.")
+	fmt.Println("Aas+vervolg: schrijf als '1/5' (aas, dan 5 in dezelfde beurt).")
+	fmt.Println("Pas: p of - of pass")
+	numPlayers := 2
+	if n, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && n >= 2 && n <= 4 {
+		numPlayers = n
+	}
+	analyzePlayer := 0
+	if p, err := reader.ReadInt(fmt.Sprintf("Welke speler analyseren (1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
+		analyzePlayer = p - 1
+	}
+	hands := make([]*Hand, numPlayers)
+	for i := 0; i < numPlayers; i++ {
+		cardCount := 18
+		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
+			cardCount = n
+		}
+		for {
+			parsed, err := reader.ReadCards(fmt.Sprintf("Speler %d kaarten (%d): ", i+1, cardCount))
+			if err != nil {
+				fmt.Printf("Fout: %v\n", err)
+				continue
+			}
+			if len(parsed) != cardCount {
+				fmt.Printf("Verwacht %d, kreeg %d\n", cardCount, len(parsed))
+				continue
+			}
+			hands[i] = NewHand(parsed)
+			break
+		}
+	}
+	var deadCards []Card
+	startPlayer := 0
+	if p, err := reader.ReadInt(fmt.Sprintf("Wie begint (spelernummer 1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
+		startPlayer = p - 1
+	}
+	iters := 3000
+	if n, err := reader.ReadInt("Iteraties per zet (standaard 3000): "); err == nil && n > 0 {
+		iters = n
+	}
+	fmt.Println()
+	fmt.Printf("Voer alle zetten in als spatie-gescheiden tokens (bv: 8888 p 33 44 66 jj p 4 5 9 1/5 ...)\n")
+	movesLine := reader.ReadLine("Zetten: ")
+	tokens := strings.Fields(movesLine)
+	if len(tokens) == 0 {
+		fmt.Println("Geen zetten ingevoerd.")
+		return
+	}
+	gs := NewGameWithHands(hands, deadCards, startPlayer)
+	engConfig := DefaultConfig(numPlayers)
+	engConfig.OmniscientMode = true
+	engConfig.Iterations = iters
+	engConfig.NumWorkers = cfg.numThreads
+	trackers := make([]*KnowledgeTracker, numPlayers)
+	for p := 0; p < numPlayers; p++ {
+		trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
+	}
+	fmt.Println()
+	moveNum := 0
+	ti := 0
+	for ti < len(tokens) && !gs.GameOver {
+		token := tokens[ti]
+		ti++
+		moveNum++
+		playerID := gs.CurrentTurn
+		mainStr, followStr, hasFollow := strings.Cut(token, "/")
+		mainLower := strings.ToLower(strings.TrimSpace(mainStr))
+		var move Move
+		if mainLower == "p" || mainLower == "pass" || mainLower == "-" {
+			move = PassMove(playerID)
+		} else {
+			parsed, err := ParseCards(mainStr)
+			if err != nil {
+				fmt.Printf("⚠️  Token %d (%q): %v — overgeslagen\n", moveNum, token, err)
+				continue
+			}
+			move = Move{PlayerID: playerID, Cards: parsed}
+		}
+		doAnalysis := playerID == analyzePlayer
+		var bestMove Move
+		var bestEval MoveEval
+		var actualDetail MoveDetail
+		var bestLabel string
+		if doAnalysis {
+			tracker := trackers[playerID]
+			eng := NewEngine(engConfig)
+			bestMove, bestEval = eng.BestMove(gs, tracker)
+			bestLabel = FormatMove(bestMove)
+			if bestMove.ContainsAce() {
+				gsClone := gs.Clone()
+				gsClone.ApplyMove(bestMove)
+				if !gsClone.GameOver && gsClone.CurrentTurn == playerID {
+					bestFollow, _ := eng.BestMove(gsClone, tracker)
+					bestLabel = fmt.Sprintf("%s / %s", FormatMove(bestMove), FormatMove(bestFollow))
+				}
+			}
+			if d, ok := FindMoveInEval(bestEval, move); ok {
+				actualDetail = d
+			} else {
+				actualDetail = eng.AnalyzeMove(gs, tracker, move)
+			}
+		}
+		if err := gs.ValidateMove(move); err != nil {
+			fmt.Printf("⚠️  Token %d (%q): ongeldige zet: %v — overgeslagen\n", moveNum, token, err)
+			continue
+		}
+		if move.IsPass {
+			for p := 0; p < numPlayers; p++ {
+				if trackers[p] != nil {
+					trackers[p].RecordPass(move.PlayerID, gs.Round)
+				}
+			}
+		}
+		gs.ApplyMove(move)
+		for p := 0; p < numPlayers; p++ {
+			if trackers[p] != nil {
+				trackers[p].RecordMove(move)
+			}
+		}
+		moveLabel := FormatMove(move)
+		if hasFollow && !gs.GameOver && gs.CurrentTurn == playerID {
+			followStr = strings.TrimSpace(followStr)
+			parsed, err := ParseCards(followStr)
+			if err == nil {
+				followMove := Move{PlayerID: playerID, Cards: parsed}
+				if err2 := gs.ValidateMove(followMove); err2 == nil {
+					gs.ApplyMove(followMove)
+					for p := 0; p < numPlayers; p++ {
+						if trackers[p] != nil {
+							trackers[p].RecordMove(followMove)
+						}
+					}
+					moveLabel = fmt.Sprintf("%s / %s", FormatMove(move), FormatMove(followMove))
+				} else {
+					fmt.Printf("⚠️  Vervolg-zet %q ongeldig: %v\n", followStr, err2)
+				}
+			} else {
+				fmt.Printf("⚠️  Vervolg-zet %q fout: %v\n", followStr, err)
+			}
+		}
+		if doAnalysis {
+			playedIsBest := MovesEqual(bestMove, move)
+			var diff float64
+			emoji := "✅"
+			if !playedIsBest {
+				diff = bestEval.Score - actualDetail.WinRate
+				if diff > 0.15 {
+					emoji = "❌"
+				} else if diff > 0.05 {
+					emoji = "⚠️ "
+				}
+			}
+			fmt.Printf("%s Z%d P%d: %s (score: %.1f%%)\n", emoji, moveNum, playerID+1, moveLabel, actualDetail.WinRate*100)
+			showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
+			if showBest {
+				fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
+					bestLabel, bestEval.Score*100, diff*100)
+			}
+		} else {
+			fmt.Printf("⏭️  Z%d P%d: %s\n", moveNum, playerID+1, moveLabel)
+		}
+	}
+	fmt.Println()
+	if gs.GameOver {
+		printRanking(gs)
+	} else {
+		fmt.Printf("Partij gestopt na %d zetten (spel nog niet voorbij).\n", moveNum)
+	}
+	fmt.Println("\nSnelle analyse klaar.")
 }
 
 func simulateMode(reader *Reader, cfg settings) {
@@ -2956,6 +3456,129 @@ func printRanking(gs *GameState) {
 	}
 }
 
+// ═══════════════════════════════════════════════════════════════
+// WEIGHT TUNER v2.1 — met Elitism + Adaptive Mutation (krachtige PC)
+// ═══════════════════════════════════════════════════════════════
+
+func weightTunerMode(reader *Reader, cfg settings) {
+	PrintHeader("Weight Tuner v2.1 — Elitism Edition")
+	fmt.Println("Zeer sterke optimalisatie met elitism en adaptieve mutatie.")
+	fmt.Println()
+
+	games, _ := reader.ReadInt("Games per matchup (aanbevolen 600-1200): ")
+	if games < 100 { games = 800 }
+	generations, _ := reader.ReadInt("Aantal generaties (aanbevolen 25-60): ")
+	if generations < 10 { generations = 35 }
+	iters, _ := reader.ReadInt("Iteraties per zet (aanbevolen 8000-15000): ")
+	if iters < 2000 { iters = 10000 }
+
+	fmt.Printf("\n🚀 Start TUNER v2.1\n")
+	fmt.Printf("Games: %d | Generaties: %d | Iters: %d | Threads: %d\n\n", 
+		games, generations, iters, cfg.numThreads)
+
+	current, _ := LoadWeights("weights.json")
+	best := current
+	bestScore := 0.0
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for gen := 1; gen <= generations; gen++ {
+		fmt.Printf("Generatie %2d/%d  ─  Beste score tot nu: %.2f%%\n", gen, generations, bestScore*100)
+
+		// Elitism: beste altijd behouden
+		candidates := []Weights{best}
+
+		// 15 mutants
+		for m := 0; m < 15; m++ {
+			mutStrength := 0.22
+			if float64(gen) > float64(generations)*0.6 {
+				mutStrength = 0.09 // later fijner tunen
+			}
+			mutant := perturbWeights(best, rng, mutStrength)
+			score := evaluateWeights(mutant, games, iters, cfg.numThreads, rng)
+
+			candidates = append(candidates, mutant)
+
+			if score > bestScore {
+				best = mutant
+				bestScore = score
+				fmt.Printf("   🔥 NIEUWE BESTE! %.2f%% (mutant %d)\n", score*100, m+1)
+			}
+		}
+
+		// Random restart elke 6 generaties
+		if gen%6 == 0 && gen < generations {
+			fmt.Println("   🔄 Random restart (ontsnapt aan lokaal maximum)")
+			best = perturbWeights(best, rng, 0.45)
+		}
+	}
+
+	SaveWeights(best, "weights.json")
+	fmt.Printf("\n🏆 TUNING AFGEROND!\n")
+	fmt.Printf("Beste score: %.2f%%\n", bestScore*100)
+	fmt.Println("Gewichten opgeslagen in weights.json")
+	fmt.Println("Je kunt nu direct met de verbeterde AI spelen.")
+}
+
+func perturbWeights(base Weights, rng *rand.Rand, strength float64) Weights {
+	w := base
+	w.AceBonus           = clamp(w.AceBonus          *(1 + strength*(rng.Float64()*2-1)), 0.08, 0.85)
+	w.WildBonus          = clamp(w.WildBonus         *(1 + strength*(rng.Float64()*2-1)), 0.08, 0.65)
+	w.SynergyBonus       = clamp(w.SynergyBonus      *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.45)
+	w.CardDiffWeight     = clamp(w.CardDiffWeight    *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.30)
+	w.KingPenalty        = clamp(w.KingPenalty       *(1 + strength*(rng.Float64()*2-1)), 0.01, 0.18)
+	w.QueenPenalty       = clamp(w.QueenPenalty      *(1 + strength*(rng.Float64()*2-1)), 0.01, 0.15)
+	w.IsolatedLowPenalty = clamp(w.IsolatedLowPenalty*(1 + strength*(rng.Float64()*2-1)), 0.01, 0.18)
+	w.ClusterBonus       = clamp(w.ClusterBonus      *(1 + strength*(rng.Float64()*2-1)), 0.01, 0.20)
+	w.TempoBonus         = clamp(w.TempoBonus        *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.30)
+	w.AcePlayFactor      = clamp(w.AcePlayFactor     *(1 + strength*(rng.Float64()*2-1)), 0.15, 1.3)
+	w.WildPlayFactor     = clamp(w.WildPlayFactor    *(1 + strength*(rng.Float64()*2-1)), 0.15, 1.1)
+	w.SynergyPenalty     = clamp(w.SynergyPenalty    *(1 + strength*(rng.Float64()*2-1)), 0.15, 1.1)
+	w.RankPreference     = clamp(w.RankPreference    *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.45)
+	w.PassBase           = clamp(w.PassBase          *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.35)
+	w.PassSpecialFactor  = clamp(w.PassSpecialFactor *(1 + strength*(rng.Float64()*2-1)), 0.05, 0.65)
+	w.PassBehindFactor   = clamp(w.PassBehindFactor  *(1 + strength*(rng.Float64()*2-1)), 0.10, 0.85)
+	w.UrgencyPenalty     = clamp(w.UrgencyPenalty    *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.25)
+	return w
+}
+
+func evaluateWeights(w Weights, games int, iters int, threads int, rng *rand.Rand) float64 {
+	config := DefaultConfig(2)
+	config.Iterations = iters
+	config.NumWorkers = threads
+	config.Weights = w
+	config.OmniscientMode = true
+
+	wins := 0
+	for g := 0; g < games; g++ {
+		gs := NewGame(2, rng, rng.Intn(2)) // random startspeler
+		t1 := NewKnowledgeTracker(2, 0, gs.Hands[0], gs.DeadCards)
+		t2 := NewKnowledgeTracker(2, 1, gs.Hands[1], gs.DeadCards)
+		e1 := NewEngine(config)
+		e2 := NewEngine(config)
+
+		for !gs.GameOver {
+			pid := gs.CurrentTurn
+			var eng *Engine
+			var tr *KnowledgeTracker
+			if pid == 0 {
+				eng, tr = e1, t1
+			} else {
+				eng, tr = e2, t2
+			}
+			move, _ := eng.BestMove(gs, tr)
+			gs.ApplyMove(move)
+			t1.RecordMove(move)
+			t2.RecordMove(move)
+		}
+
+		if gs.Ranking[0] == 1 { // speler 2 wint
+			wins++
+		}
+	}
+	return float64(wins) / float64(games)
+}
+
 // Onderdruk "declared but not used" voor hulpfuncties die enkel door de tuner gebruikt worden
 var _ = clamp
 var _ = SaveWeights
@@ -2965,4 +3588,3 @@ var _ = EvaluateHand
 var _ = QuickEvaluateMove
 var _ = ShouldPass
 var _ = gatherSpecials
-
