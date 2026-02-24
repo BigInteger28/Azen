@@ -1,16 +1,2 @@
 {
-  "ace_bonus": 0.14,
-  "wild_bonus": 0.1,
-  "synergy_bonus": 0.05,
-  "card_diff_weight": 0.05,
-  "king_penalty": 0.04,
-  "queen_penalty": 0.02,
-  "isolated_low_penalty": 0.03,
-  "cluster_bonus": 0.02,
-  "ace_play_factor": 0.2,
-  "wild_play_factor": 0.35,
-  "synergy_penalty": 0.5,
-  "rank_preference": 0.1,
-  "pass_base": 0.1,
-  "pass_special_factor": 0.25
 }
