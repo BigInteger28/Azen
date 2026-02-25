@@ -1408,20 +1408,34 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 	mq.Score = 50.0
 	wildsUsed := 0
 	resetsUsed := 0
+	normalsUsed := 0
 	for _, c := range move.Cards {
 		if c.IsWild() {
 			wildsUsed++
-		}
-		if c.IsReset() {
+		} else if c.IsReset() {
 			resetsUsed++
+		} else {
+			normalsUsed++
 		}
 	}
 	effectiveRank := move.EffectiveRank(gs.Round.TableRank)
-	if wildsUsed > 0 && effectiveRank < RankTen {
-		mq.Score -= float64(wildsUsed) * 5.0
-		mq.WastesWilds = true
-		mq.Reasoning = "Wastes wildcards on low play"
+
+	// Wild-verspilling: scherpere straf naarmate de rank lager is.
+	// Wild op rank 3-5 is catastrofaal; op rank 6-9 is slecht; op 10+ is acceptabel.
+	if wildsUsed > 0 {
+		if effectiveRank <= RankFive {
+			mq.Score -= float64(wildsUsed) * 12.0
+			mq.WastesWilds = true
+			mq.Reasoning = "Wastes wildcards on very low play"
+		} else if effectiveRank < RankTen {
+			mq.Score -= float64(wildsUsed) * 7.0
+			mq.WastesWilds = true
+			mq.Reasoning = "Wastes wildcards on low play"
+		} else {
+			mq.Score -= float64(wildsUsed) * 2.0 // mild; wild op K is prima
+		}
 	}
+
 	if resetsUsed > 0 {
 		mq.Score += 5.0
 		mq.WastesAces = resetsUsed > 1
@@ -1430,11 +1444,36 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 			mq.Reasoning = "Uses multiple resets unnecessarily"
 		}
 	}
-	if effectiveRank > 0 {
-		rankValue := float64(effectiveRank-RankThree) / float64(RankAce-RankThree)
-		mq.Score -= rankValue * 10.0
+
+	// Response-context: bij een response-ronde is de LAAGSTE winnende zet het best.
+	// Je wilt sterke kaarten bewaren voor later. Straf proportioneel aan "overshoot".
+	if !gs.Round.IsOpen && effectiveRank > 0 {
+		overshoot := float64(effectiveRank-gs.Round.TableRank) - 1.0
+		if overshoot < 0 {
+			overshoot = 0
+		}
+		mq.Score -= overshoot * 3.0 // bijv. Queen op een 6 tafel = -15 (overshoot 5)
 	}
-	mq.Score += float64(len(move.Cards)) * 2.0
+
+	// Open ronde: lage kaarten dumpen is goed.
+	if gs.Round.IsOpen && effectiveRank > 0 {
+		rankValue := float64(effectiveRank-RankThree) / float64(RankAce-RankThree)
+		mq.Score -= rankValue * 8.0 // hoge kaarten in open ronde = verspilling
+	}
+
+	// Meerdere kaarten tegelijk kwijtraken is goed.
+	mq.Score += float64(len(move.Cards)) * 3.0
+
+	// Paar-breek penalty: als je een paar breekt om een single te spelen, is dat slecht.
+	if normalsUsed == 1 && wildsUsed == 0 && resetsUsed == 0 {
+		for _, c := range move.Cards {
+			if hand.CountRank(c.Rank) >= 2 {
+				mq.Score -= 5.0 // breekt een cluster
+				break
+			}
+		}
+	}
+
 	if cardsAfter <= 3 {
 		mq.Score += 15.0
 		mq.CreatesWinThreat = true
@@ -1521,9 +1560,10 @@ type mctsNode struct {
 func newRoot() *mctsNode { return &mctsNode{playerID: -1} }
 
 type MoveEval struct {
-	Score   float64
-	Visits  int
-	Details []MoveDetail
+	Score          float64
+	Visits         int
+	Details        []MoveDetail
+	ForcedWinDepth int // >0 als gedwongen winst: aantal eigen beurten tot winst
 }
 
 func (me MoveEval) String() string {
@@ -1541,10 +1581,10 @@ func (md MoveDetail) String() string {
 }
 
 // findImmediateWin zoekt naar een gegarandeerde winnende zet ("schaakmat")
-// via minimax. Bij ≤10 totale kaarten doorzoekt het ALLE mogelijke antwoorden
-// van de tegenstander. Als er een pad is waar wij ALTIJD winnen ongeacht
-// tegenstander-reacties, retourneert het de eerste zet van dat pad.
-func findImmediateWin(gs *GameState) *Move {
+// via minimax. Bij ≤12 totale kaarten doorzoekt het ALLE mogelijke antwoorden
+// van de tegenstander. Retourneert de eerste zet van het winnende pad en het
+// aantal eigen beurten tot winst (1 = directe win, 2 = 2-staps combo, etc.).
+func findImmediateWin(gs *GameState) (*Move, int) {
 	pid := gs.CurrentTurn
 	handCount := gs.Hands[pid].Count()
 	moves := gs.GetLegalMoves()
@@ -1553,7 +1593,7 @@ func findImmediateWin(gs *GameState) *Move {
 	for _, m := range moves {
 		if !m.IsPass && len(m.Cards) == handCount {
 			mv := m
-			return &mv
+			return &mv, 1
 		}
 	}
 
@@ -1563,7 +1603,7 @@ func findImmediateWin(gs *GameState) *Move {
 		totalCards += h.Count()
 	}
 	if totalCards > 12 {
-		return nil // te veel kaarten, minimax te duur
+		return nil, 0
 	}
 	// Adaptieve diepte: bij meer kaarten minder diep zoeken (bredere boom)
 	maxDepth := totalCards * 3
@@ -1573,6 +1613,8 @@ func findImmediateWin(gs *GameState) *Move {
 	nodes := 0
 
 	// Probeer niet-pass zetten eerst (sneller naar winst)
+	bestDepth := -1
+	var bestMove *Move
 	for _, m := range moves {
 		if m.IsPass {
 			continue
@@ -1581,47 +1623,67 @@ func findImmediateWin(gs *GameState) *Move {
 		sim.ApplyMove(m)
 		if sim.GameOver && sim.Winner == pid {
 			mv := m
-			return &mv
+			return &mv, 1
 		}
-		if forcedWinSearch(sim, pid, maxDepth-1, &nodes, 500000) {
-			mv := m
-			return &mv
+		d := forcedWinDepth(sim, pid, maxDepth-1, &nodes, 500000)
+		if d >= 0 {
+			myMoves := d + 1 // +1 voor deze zet
+			if bestMove == nil || myMoves < bestDepth {
+				bestDepth = myMoves
+				mv := m
+				bestMove = &mv
+			}
 		}
 	}
-	return nil
+	if bestMove != nil {
+		return bestMove, bestDepth
+	}
+	return nil, 0
 }
 
-// forcedWinSearch bepaalt via minimax of de huidige positie een gedwongen
-// winst is voor myID. Bij onze beurt: minstens 1 zet moet forceren.
-// Bij tegenstander: ALLE antwoorden moeten naar onze winst leiden.
-func forcedWinSearch(gs *GameState, myID int, depth int, nodes *int, maxNodes int) bool {
+// forcedWinDepth bepaalt via minimax het aantal eigen beurten tot gedwongen
+// winst. Retourneert -1 als geen forced win, of ≥0 (het aantal resterende
+// eigen beurten). Bij onze beurt telt elke zet als +1. Bij tegenstander telt
+// het niet mee (hun zet kost ons geen beurt), maar we nemen het worst-case pad.
+func forcedWinDepth(gs *GameState, myID int, depth int, nodes *int, maxNodes int) int {
 	*nodes++
 	if *nodes > maxNodes {
-		return false
+		return -1
 	}
 	if gs.GameOver {
-		return gs.Winner == myID
+		if gs.Winner == myID {
+			return 0
+		}
+		return -1
 	}
 	if depth <= 0 {
-		return false
+		return -1
 	}
 
 	moves := gs.GetLegalMoves()
 
 	if gs.CurrentTurn == myID {
-		// Onze beurt: minstens 1 zet moet naar gedwongen winst leiden
-		// Probeer speel-zetten eerst (efficiënter dan PASS)
+		// Onze beurt: zoek de snelste geforceerde winst
+		best := -1
+		// Probeer speel-zetten eerst
 		for _, m := range moves {
 			if m.IsPass {
 				continue
 			}
 			sim := gs.Clone()
 			sim.ApplyMove(m)
-			if forcedWinSearch(sim, myID, depth-1, nodes, maxNodes) {
-				return true
+			d := forcedWinDepth(sim, myID, depth-1, nodes, maxNodes)
+			if d >= 0 {
+				total := d + 1 // +1 want wij speelden een zet
+				if best < 0 || total < best {
+					best = total
+				}
 			}
 		}
-		// PASS alleen in response-rondes (in open ronde altijd speelbare kaarten)
+		if best >= 0 {
+			return best
+		}
+		// PASS alleen in response-rondes
 		if !gs.Round.IsOpen {
 			for _, m := range moves {
 				if !m.IsPass {
@@ -1629,23 +1691,29 @@ func forcedWinSearch(gs *GameState, myID int, depth int, nodes *int, maxNodes in
 				}
 				sim := gs.Clone()
 				sim.ApplyMove(m)
-				if forcedWinSearch(sim, myID, depth-1, nodes, maxNodes) {
-					return true
+				d := forcedWinDepth(sim, myID, depth-1, nodes, maxNodes)
+				if d >= 0 {
+					return d // PASS kost ons geen "beurt" in de telling
 				}
 			}
 		}
-		return false
+		return -1
 	}
 
-	// Tegenstander: ALLE zetten moeten naar onze winst leiden
+	// Tegenstander: ALLE zetten moeten naar onze winst leiden, neem worst-case
+	worst := 0
 	for _, m := range moves {
 		sim := gs.Clone()
 		sim.ApplyMove(m)
-		if !forcedWinSearch(sim, myID, depth-1, nodes, maxNodes) {
-			return false
+		d := forcedWinDepth(sim, myID, depth-1, nodes, maxNodes)
+		if d < 0 {
+			return -1 // tegenstander heeft een ontsnapping
+		}
+		if d > worst {
+			worst = d // worst-case pad (tegenstander vertraagt maximaal)
 		}
 	}
-	return true
+	return worst
 }
 
 type workerResult struct {
@@ -1795,8 +1863,8 @@ func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed 
 }
 
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
-	if win := findImmediateWin(gs); win != nil {
-		return *win, MoveEval{Score: 1.0, Visits: 1}
+	if win, depth := findImmediateWin(gs); win != nil {
+		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
 	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
 	rootFiltered := filterDominatedMoves(gs.GetLegalMoves(), gs.Round)
@@ -1876,15 +1944,13 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		}
 	}
 	bestMove := moveMap[bestKey]
-	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat of als 2-speler eindspel.
-	// 2-speler: tegenstander krijgt vrije open ronde → kan alles in 1 zet wegspelen.
-	// Drempel gebaseerd op tegenstander's kaarten: < 9 = dodelijk gebied.
+	// Pass-override: alleen forceren als PASS duidelijk slechter is dan de beste
+	// speel-zet, EN de situatie gevaarlijk is (speler staat ver achter).
+	// Voorheen overschreef dit PASS altijd in 2-speler, zelfs als PASS objectief beter was.
 	myID := gs.CurrentTurn
 	myCards := gs.Hands[myID].Count()
 	oppCards := minOppHandCount(gs, myID)
-	shouldOverridePass := bestMove.IsPass && (myCards-oppCards >= 4 ||
-		(activePlayerCount(gs) <= 2 && (oppCards < 9 || myCards >= oppCards)))
-	if shouldOverridePass {
+	if bestMove.IsPass {
 		bestNonPassKey := ""
 		bestNonPassWR := -1.0
 		for k, m := range moveMap {
@@ -1899,7 +1965,15 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 				}
 			}
 		}
-		if bestNonPassKey != "" {
+		passWR := 0.0
+		if bestVisits > 0 {
+			passWR = totalWins[bestKey] / float64(bestVisits)
+		}
+		// Override PASS alleen als:
+		// 1) Er een niet-pass zet is met vergelijkbare of betere winrate (minder dan 3% verschil)
+		// 2) EN de situatie gevaarlijk is (4+ kaarten achter, of 2-speler eindspel met ≤5 opp kaarten)
+		urgent := myCards-oppCards >= 4 || (activePlayerCount(gs) <= 2 && oppCards <= 5)
+		if bestNonPassKey != "" && urgent && (bestNonPassWR >= passWR-0.03) {
 			bestKey = bestNonPassKey
 			bestVisits = totalVisits[bestKey]
 			bestMove = moveMap[bestKey]
@@ -1946,15 +2020,15 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 		e.backprop(node, result, myID)
 	}
 	bestMove, eval := e.pickBest(root, myID)
-	// Nooit PASS aanbevelen als speler 4+ kaarten achter staat of als 2-speler eindspel.
-	// Drempel gebaseerd op tegenstander's kaarten: < 9 = dodelijk gebied.
+	// Pass-override: alleen forceren als situatie urgent is en verschil klein.
 	myCards2 := gs.Hands[myID].Count()
 	oppCards2 := minOppHandCount(gs, myID)
-	if bestMove.IsPass && (myCards2-oppCards2 >= 4 ||
-		(activePlayerCount(gs) <= 2 && (oppCards2 < 9 || myCards2 >= oppCards2))) {
+	urgent2 := myCards2-oppCards2 >= 4 || (activePlayerCount(gs) <= 2 && oppCards2 <= 5)
+	if bestMove.IsPass && urgent2 {
+		passWR := eval.Score
 		if m, ok := bestNonPassFromDetails(eval.Details); ok {
 			for _, d := range eval.Details {
-				if MovesEqual(d.Move, m) {
+				if MovesEqual(d.Move, m) && d.WinRate >= passWR-0.03 {
 					return m, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
 				}
 			}
@@ -2129,7 +2203,17 @@ func (e *Engine) ucb1Select(node *mctsNode, maximizing bool) *mctsNode {
 
 func (e *Engine) simulate(gs *GameState, myID int) float64 {
 	sim := gs.Clone()
-	for i := 0; i < 400 && !sim.GameOver; i++ {
+	// Adaptieve rollout-limiet: bij weinig kaarten altijd tot GameOver uitspelen.
+	// Bij veel kaarten: max 200 zetten (meer dan genoeg, voorkomt oneindige loops).
+	totalCards := 0
+	for _, h := range sim.Hands {
+		totalCards += h.Count()
+	}
+	maxSteps := 200
+	if totalCards <= 12 {
+		maxSteps = 800 // bij weinig kaarten ALTIJD tot GameOver, geen evalPos-afbreking
+	}
+	for i := 0; i < maxSteps && !sim.GameOver; i++ {
 		moves := sim.GetLegalMoves()
 		if len(moves) == 0 {
 			break
@@ -2449,6 +2533,22 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 		cnt := hand.CountRank(r)
 		if cnt >= 2 {
 			score += float64(cnt-1) * wts.ClusterBonus
+			// Hoge paren zijn meer waard: een paar Aces is veel sterker dan paar 3-en.
+			// Bonus gebaseerd op rank (3=0.0, Ace=1.0) × 0.04 per extra kaart.
+			rankFactor := float64(r-RankThree) / float64(RankAce-RankThree)
+			score += float64(cnt-1) * rankFactor * 0.04
+		}
+	}
+	// Sluitende combinatie: joker + pair/triple in hand ≤ 5 kaarten = bijna zekere win.
+	// De joker reset de ronde, daarna dump je het pair in 1 zet.
+	if resets > 0 && myCount <= 5 {
+		for r := RankThree; r <= RankAce; r++ {
+			cnt := hand.CountRank(r)
+			if cnt >= 2 && cnt+resets >= myCount {
+				// Joker + pair/triple = alle kaarten in 2 zetten
+				score += 0.15
+				break
+			}
 		}
 	}
 	// Tempo: open ronde op je beurt is een voordeel, maar proportioneel —
@@ -3147,8 +3247,9 @@ func playMode(reader *Reader, cfg settings) {
 			PrintCards(gs.Hands[myPlayer])
 			fmt.Println("\n🤔 Engine denkt na...")
 			bestMove, eval := eng.BestMove(gs, tracker)
-			if eval.Score >= 1.0 && eval.Visits <= 1 {
-				fmt.Printf("\n♟️  Gedwongen winst gevonden: %s\n\n", FormatMove(bestMove))
+			if eval.ForcedWinDepth > 0 {
+				fmt.Printf("\n♟️  Gedwongen winst in %d beurt(en)!\n", eval.ForcedWinDepth)
+				fmt.Printf("💡 Engine suggereert: %s\n\n", FormatMove(bestMove))
 			} else {
 				fmt.Printf("\n💡 Engine suggereert: %s (winst: %s)\n\n",
 					FormatMove(bestMove), FormatScore(eval.Score))
@@ -3169,8 +3270,9 @@ func playMode(reader *Reader, cfg settings) {
 				case "rethink":
 					fmt.Println("\n🤔 Engine herdenkt de situatie...")
 					bestMove, eval = eng.BestMove(gs, tracker)
-					if eval.Score >= 1.0 && eval.Visits <= 1 {
-						fmt.Printf("\n♟️  Gedwongen winst gevonden: %s\n\n", FormatMove(bestMove))
+					if eval.ForcedWinDepth > 0 {
+						fmt.Printf("\n♟️  Gedwongen winst in %d beurt(en)!\n", eval.ForcedWinDepth)
+						fmt.Printf("💡 Nieuwe suggestie: %s\n\n", FormatMove(bestMove))
 					} else {
 						fmt.Printf("\n💡 Nieuwe suggestie: %s (winst: %s)\n\n",
 							FormatMove(bestMove), FormatScore(eval.Score))
@@ -3468,7 +3570,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 			}
 		}
 		if doAnalysis {
-			forcedWin := bestEval.Score >= 1.0 && bestEval.Visits <= 1
+			forcedWin := bestEval.ForcedWinDepth > 0
 			playedIsBest := MovesEqual(bestMove, move)
 			var diff float64
 			emoji := "✅"
@@ -3484,9 +3586,10 @@ func analyzeMode(reader *Reader, cfg settings) {
 			}
 			fmt.Printf("%s Gespeeld: %s (score: %.1f%%)\n", emoji, moveLabel, actualDetail.WinRate*100)
 			if forcedWin && !playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst gemist! Beste was: %s\n", bestLabel)
+				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
+					bestEval.ForcedWinDepth, bestLabel)
 			} else if forcedWin && playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst gevonden!\n")
+				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
 			} else {
 				showBest := !playedIsBest &&
 					(diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
@@ -3690,7 +3793,7 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			}
 		}
 		if doAnalysis {
-			forcedWin := bestEval.Score >= 1.0 && bestEval.Visits <= 1
+			forcedWin := bestEval.ForcedWinDepth > 0
 			playedIsBest := MovesEqual(bestMove, move)
 			var diff float64
 			emoji := "✅"
@@ -3706,9 +3809,10 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			}
 			fmt.Printf("%s Z%d P%d: %s (score: %.1f%%)\n", emoji, moveNum, playerID+1, moveLabel, actualDetail.WinRate*100)
 			if forcedWin && !playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst gemist! Beste was: %s\n", bestLabel)
+				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
+					bestEval.ForcedWinDepth, bestLabel)
 			} else if forcedWin && playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst gevonden!\n")
+				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
 			} else {
 				showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
 				if showBest {
