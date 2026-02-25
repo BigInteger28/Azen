@@ -39,9 +39,9 @@ const (
 	RankJack  Rank = 11
 	RankQueen Rank = 12
 	RankKing  Rank = 13
-	RankTwo   Rank = 14 // Wildcard
-	RankJoker Rank = 15 // Wildcard (same as 2)
-	RankAce   Rank = 16 // Played on anything, resets round
+	RankAce   Rank = 14 // Hoogste naturelle kaart (boven Koning)
+	RankTwo   Rank = 15 // Wildcard (vervangt elke kaart)
+	RankJoker Rank = 16 // Reset-kaart (verslaat alles, opent nieuwe ronde)
 )
 
 type Suit int
@@ -60,9 +60,10 @@ type Card struct {
 	Suit Suit
 }
 
-func (c Card) IsWild() bool    { return c.Rank == RankTwo || c.Rank == RankJoker }
-func (c Card) IsAce() bool     { return c.Rank == RankAce }
-func (c Card) IsSpecial() bool { return c.IsWild() || c.IsAce() }
+func (c Card) IsWild() bool    { return c.Rank == RankTwo }    // alleen de 2 is wildcard
+func (c Card) IsReset() bool   { return c.Rank == RankJoker }  // joker reset de ronde
+func (c Card) IsAce() bool     { return c.Rank == RankAce }    // naturelle hoge kaart
+func (c Card) IsSpecial() bool { return c.IsWild() || c.IsReset() }
 
 func (c Card) String() string { return c.RankStr() }
 
@@ -228,10 +229,10 @@ func (h *Hand) CountWilds() int {
 	return n
 }
 
-func (h *Hand) CountAces() int {
+func (h *Hand) CountResets() int {
 	n := 0
 	for _, c := range h.Cards {
-		if c.IsAce() {
+		if c.IsReset() {
 			n++
 		}
 	}
@@ -284,8 +285,9 @@ func NewDeck() *Deck {
 	d := &Deck{}
 	suits := []Suit{SuitHearts, SuitDiamonds, SuitClubs, SuitSpades}
 	ranks := []Rank{
-		RankAce, RankTwo, RankThree, RankFour, RankFive, RankSix, RankSeven,
+		RankThree, RankFour, RankFive, RankSix, RankSeven,
 		RankEight, RankNine, RankTen, RankJack, RankQueen, RankKing,
+		RankAce, RankTwo, // Aas = hoogste naturelle; Twee = wildcard
 	}
 	for _, s := range suits {
 		for _, r := range ranks {
@@ -332,7 +334,7 @@ func (d *Deck) Deal(numPlayers, cardsPerPlayer int) ([]*Hand, []Card) {
 func NormalRanks() []Rank {
 	return []Rank{
 		RankThree, RankFour, RankFive, RankSix, RankSeven,
-		RankEight, RankNine, RankTen, RankJack, RankQueen, RankKing,
+		RankEight, RankNine, RankTen, RankJack, RankQueen, RankKing, RankAce,
 	}
 }
 
@@ -357,9 +359,9 @@ func (m Move) String() string {
 	return fmt.Sprintf("P%d: %s", m.PlayerID, CardsToString(m.Cards))
 }
 
-func (m Move) ContainsAce() bool {
+func (m Move) ContainsReset() bool {
 	for _, c := range m.Cards {
-		if c.IsAce() {
+		if c.IsReset() {
 			return true
 		}
 	}
@@ -544,24 +546,24 @@ func (gs *GameState) ValidateMove(m Move) error {
 }
 
 func (gs *GameState) validateOpenPlay(m Move) error {
-	hasAce, hasNormal, normalRank, err := classifyCards(m.Cards)
+	hasReset, hasNormal, normalRank, err := classifyCards(m.Cards)
 	if err != nil {
 		return err
 	}
-	if hasAce && hasNormal {
-		return fmt.Errorf("een aas mag enkel samen met een 2 of joker gespeeld worden, niet met normale kaarten")
+	if hasReset && hasNormal {
+		return fmt.Errorf("een joker (0) mag enkel samen met een 2 of andere joker gespeeld worden, niet met normale kaarten")
 	}
 	_ = normalRank
 	return nil
 }
 
 func (gs *GameState) validateResponsePlay(m Move) error {
-	hasAce, hasNormal, normalRank, err := classifyCards(m.Cards)
+	hasReset, hasNormal, normalRank, err := classifyCards(m.Cards)
 	if err != nil {
 		return err
 	}
-	if hasAce && hasNormal {
-		return fmt.Errorf("een aas mag enkel samen met een 2 of joker gespeeld worden, niet met normale kaarten")
+	if hasReset && hasNormal {
+		return fmt.Errorf("een joker (0) mag enkel samen met een 2 of andere joker gespeeld worden, niet met normale kaarten")
 	}
 	if len(m.Cards) != gs.Round.Count {
 		return fmt.Errorf("moet exact %d kaart(en) spelen (gespeeld: %d)", gs.Round.Count, len(m.Cards))
@@ -572,13 +574,14 @@ func (gs *GameState) validateResponsePlay(m Move) error {
 	return nil
 }
 
-func classifyCards(cc []Card) (hasAce bool, hasNormal bool, normalRank Rank, err error) {
+func classifyCards(cc []Card) (hasReset bool, hasNormal bool, normalRank Rank, err error) {
 	for _, c := range cc {
-		if c.IsAce() {
-			hasAce = true
+		if c.IsReset() {
+			hasReset = true
 		} else if c.IsWild() {
 			// wildcards zijn neutraal
 		} else {
+			// Normale kaarten: 3..K en Aas (1 is nu de hoogste naturelle rank)
 			hasNormal = true
 			if normalRank == 0 {
 				normalRank = c.Rank
@@ -618,7 +621,7 @@ func (gs *GameState) ApplyMove(m Move) {
 		if gs.finishPlayer(pid) {
 			return
 		}
-		if m.ContainsAce() {
+		if m.ContainsReset() {
 			gs.Round = RoundState{IsOpen: true, LastPlayerID: pid}
 			gs.CurrentTurn = gs.nextActiveTurn(pid)
 		} else {
@@ -634,7 +637,7 @@ func (gs *GameState) ApplyMove(m Move) {
 		return
 	}
 
-	if m.ContainsAce() {
+	if m.ContainsReset() {
 		gs.Round = RoundState{IsOpen: true, LastPlayerID: pid}
 		gs.CurrentTurn = pid
 		return
@@ -679,7 +682,7 @@ func genOpenMoves(pid int, hand *Hand) []Move {
 		byRank[c.Rank] = append(byRank[c.Rank], c)
 	}
 	wilds := gatherWilds(hand)
-	aces := gatherAces(hand)
+	resets := gatherResets(hand)
 
 	for _, rank := range NormalRanks() {
 		normals := byRank[rank]
@@ -717,7 +720,7 @@ func genOpenMoves(pid int, hand *Hand) []Move {
 		}
 	}
 
-	moves = append(moves, genAceMoves(pid, aces, wilds)...)
+	moves = append(moves, genResetMoves(pid, resets, wilds)...)
 	return dedup(moves)
 }
 
@@ -726,7 +729,7 @@ func genResponseMoves(pid int, hand *Hand, round RoundState) []Move {
 	need := round.Count
 	tableRank := round.TableRank
 	wilds := gatherWilds(hand)
-	aces := gatherAces(hand)
+	resets := gatherResets(hand)
 
 	for _, rank := range NormalRanks() {
 		if rank <= tableRank {
@@ -764,25 +767,25 @@ func genResponseMoves(pid int, hand *Hand, round RoundState) []Move {
 		}
 	}
 
-	moves = append(moves, genAceResponseMoves(pid, aces, wilds, need)...)
+	moves = append(moves, genResetResponseMoves(pid, resets, wilds, need)...)
 	return dedup(moves)
 }
 
-func genAceMoves(pid int, aces, wilds []Card) []Move {
+func genResetMoves(pid int, resets, wilds []Card) []Move {
 	var moves []Move
-	for numAce := 1; numAce <= len(aces); numAce++ {
-		maxW := imin(len(wilds), 6-numAce)
-		aCombos := combos(aces, numAce)
+	for numReset := 1; numReset <= len(resets); numReset++ {
+		maxW := imin(len(wilds), 6-numReset)
+		rCombos := combos(resets, numReset)
 		for numWild := 0; numWild <= maxW; numWild++ {
 			if numWild == 0 {
-				for _, ac := range aCombos {
-					moves = append(moves, Move{PlayerID: pid, Cards: ac})
+				for _, rc := range rCombos {
+					moves = append(moves, Move{PlayerID: pid, Cards: rc})
 				}
 			} else {
 				wCombos := combos(wilds, numWild)
-				for _, ac := range aCombos {
+				for _, rc := range rCombos {
 					for _, wc := range wCombos {
-						merged := append(append([]Card{}, ac...), wc...)
+						merged := append(append([]Card{}, rc...), wc...)
 						moves = append(moves, Move{PlayerID: pid, Cards: merged})
 					}
 				}
@@ -792,23 +795,23 @@ func genAceMoves(pid int, aces, wilds []Card) []Move {
 	return moves
 }
 
-func genAceResponseMoves(pid int, aces, wilds []Card, need int) []Move {
+func genResetResponseMoves(pid int, resets, wilds []Card, need int) []Move {
 	var moves []Move
-	for numAce := 1; numAce <= imin(len(aces), need); numAce++ {
-		numWild := need - numAce
+	for numReset := 1; numReset <= imin(len(resets), need); numReset++ {
+		numWild := need - numReset
 		if numWild > len(wilds) {
 			continue
 		}
-		aCombos := combos(aces, numAce)
+		rCombos := combos(resets, numReset)
 		if numWild == 0 {
-			for _, ac := range aCombos {
-				moves = append(moves, Move{PlayerID: pid, Cards: ac})
+			for _, rc := range rCombos {
+				moves = append(moves, Move{PlayerID: pid, Cards: rc})
 			}
 		} else {
 			wCombos := combos(wilds, numWild)
-			for _, ac := range aCombos {
+			for _, rc := range rCombos {
 				for _, wc := range wCombos {
-					merged := append(append([]Card{}, ac...), wc...)
+					merged := append(append([]Card{}, rc...), wc...)
 					moves = append(moves, Move{PlayerID: pid, Cards: merged})
 				}
 			}
@@ -837,14 +840,14 @@ func gatherWilds(hand *Hand) []Card {
 	return wilds
 }
 
-func gatherAces(hand *Hand) []Card {
-	var aces []Card
+func gatherResets(hand *Hand) []Card {
+	var resets []Card
 	for _, c := range hand.Cards {
-		if c.IsAce() {
-			aces = append(aces, c)
+		if c.IsReset() {
+			resets = append(resets, c)
 		}
 	}
-	return aces
+	return resets
 }
 
 func combos(arr []Card, k int) [][]Card {
@@ -1006,6 +1009,14 @@ func NewKnowledgeTracker(numPlayers, myID int, myHand *Hand, deadCards []Card) *
 	for i := range kt.HandCounts {
 		kt.HandCounts[i] = 18
 	}
+	// Spelregel: elke speler krijgt bij de verdeling gegarandeerd minstens 1 wildcard (2).
+	// → Voeg voor elke tegenstander 1 Twee toe als zekere suspicion.
+	// updateSuspicions() verwijdert die automatisch zodra de tegenstander een Twee speelt.
+	for p := 0; p < numPlayers; p++ {
+		if p != myID {
+			kt.Suspicions[p] = []Card{{Rank: RankTwo}}
+		}
+	}
 	return kt
 }
 
@@ -1110,9 +1121,8 @@ func (kt *KnowledgeTracker) ClearExclusions(playerID int) {
 func (kt *KnowledgeTracker) ExcludedRanks(playerID int) map[Rank]bool {
 	excluded := map[Rank]bool{}
 	for _, pr := range kt.PassRecords[playerID] {
-		excluded[RankAce] = true
-		excluded[RankTwo] = true
-		excluded[RankJoker] = true
+		excluded[RankJoker] = true // joker reset: als je er een had, had je gereset
+		excluded[RankTwo] = true   // wildcard: als je er genoeg had, had je gespeeld
 		for _, r := range NormalRanks() {
 			if r > pr.TableRank {
 				excluded[r] = true
@@ -1188,9 +1198,9 @@ func (kt *KnowledgeTracker) PossibleOpponentCards() []Card {
 		numDecks = 2
 	}
 	normalRanks := []Rank{
-		RankAce, RankTwo, RankThree, RankFour,
-		RankFive, RankSix, RankSeven, RankEight,
-		RankNine, RankTen, RankJack, RankQueen, RankKing,
+		RankThree, RankFour, RankFive, RankSix, RankSeven,
+		RankEight, RankNine, RankTen, RankJack, RankQueen, RankKing,
+		RankAce, RankTwo, // beide aanwezig in 4 exemplaren per deck
 	}
 	totalCount := map[Rank]int{}
 	for _, r := range normalRanks {
@@ -1315,7 +1325,7 @@ type HandStrength struct {
 func EvaluateHand(hand *Hand) HandStrength {
 	hs := HandStrength{CardCount: hand.Count()}
 	hs.WildCount = hand.CountWilds()
-	hs.AceCount = hand.CountAces()
+	hs.AceCount = hand.CountRank(RankAce) // Aas is nu de hoogste naturelle kaart
 	rankCounts := make(map[Rank]int)
 	for _, c := range hand.Cards {
 		if !c.IsSpecial() {
@@ -1382,13 +1392,13 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 	}
 	mq.Score = 50.0
 	wildsUsed := 0
-	acesUsed := 0
+	resetsUsed := 0
 	for _, c := range move.Cards {
 		if c.IsWild() {
 			wildsUsed++
 		}
-		if c.IsAce() {
-			acesUsed++
+		if c.IsReset() {
+			resetsUsed++
 		}
 	}
 	effectiveRank := move.EffectiveRank(gs.Round.TableRank)
@@ -1397,16 +1407,16 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 		mq.WastesWilds = true
 		mq.Reasoning = "Wastes wildcards on low play"
 	}
-	if acesUsed > 0 {
+	if resetsUsed > 0 {
 		mq.Score += 5.0
-		mq.WastesAces = acesUsed > 1
+		mq.WastesAces = resetsUsed > 1
 		if mq.WastesAces {
-			mq.Score -= float64(acesUsed-1) * 8.0
-			mq.Reasoning = "Uses multiple aces unnecessarily"
+			mq.Score -= float64(resetsUsed-1) * 8.0
+			mq.Reasoning = "Uses multiple resets unnecessarily"
 		}
 	}
 	if effectiveRank > 0 {
-		rankValue := float64(effectiveRank-RankThree) / float64(RankKing-RankThree)
+		rankValue := float64(effectiveRank-RankThree) / float64(RankAce-RankThree)
 		mq.Score -= rankValue * 10.0
 	}
 	mq.Score += float64(len(move.Cards)) * 2.0
@@ -1414,7 +1424,7 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 		mq.Score += 15.0
 		mq.CreatesWinThreat = true
 	}
-	if gs.Round.IsOpen && acesUsed > 0 {
+	if gs.Round.IsOpen && resetsUsed > 0 {
 		mq.Score += 10.0
 	}
 	return mq
@@ -1434,6 +1444,7 @@ func ShouldPass(gs *GameState, playerID int) bool {
 	if gs.Round.TableRank >= RankKing {
 		normalCardsAbove := 0
 		for _, c := range hand.Cards {
+			// !IsSpecial() now includes Ace (natural card)
 			if !c.IsSpecial() && c.Rank > gs.Round.TableRank {
 				normalCardsAbove++
 			}
@@ -1462,7 +1473,7 @@ type Config struct {
 func DefaultConfig(numPlayers int) Config {
 	w, _ := LoadWeights("storage/shared/Documents/weights.json")
 	return Config{
-		Iterations:   5000,
+		Iterations:   10000,
 		MaxTime:      0,
 		ExploreConst: 1.4,
 		NumPlayers:   numPlayers,
@@ -1540,7 +1551,7 @@ type workerResult struct {
 // beschikbaar (bijv. K+wild als QQ de hoogste naturelle zet is: rank 13 > rank 12).
 // Zo is de filter veilig bij zowel lage als hoge iteratiecounts.
 //
-// Puur-wildcardspellen (2+joker), aas-zetten en PASS worden nooit gefilterd.
+// Puur-wildcardspellen (2+joker), reset-zetten (joker) en PASS worden nooit gefilterd.
 // In open rondes geen filter.
 func filterDominatedMoves(moves []Move, round RoundState) []Move {
 	if round.IsOpen {
@@ -1554,17 +1565,17 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 		if m.IsPass {
 			continue
 		}
-		hasWild, hasAce, hasNormal := false, false, false
+		hasWild, hasReset, hasNormal := false, false, false
 		for _, c := range m.Cards {
 			if c.IsWild() {
 				hasWild = true
-			} else if c.IsAce() {
-				hasAce = true
+			} else if c.IsReset() {
+				hasReset = true
 			} else {
 				hasNormal = true
 			}
 		}
-		if !hasWild && !hasAce && hasNormal {
+		if !hasWild && !hasReset && hasNormal {
 			if er := m.EffectiveRank(tableRank); er > maxNaturalRank {
 				maxNaturalRank = er
 			}
@@ -1580,12 +1591,12 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 			filtered = append(filtered, m)
 			continue
 		}
-		hasWild, hasAce, hasNormal := false, false, false
+		hasWild, hasReset, hasNormal := false, false, false
 		for _, c := range m.Cards {
 			if c.IsWild() {
 				hasWild = true
-			} else if c.IsAce() {
-				hasAce = true
+			} else if c.IsReset() {
+				hasReset = true
 			} else {
 				hasNormal = true
 			}
@@ -1596,7 +1607,7 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 		// Regel: filter oversized special combos als een naturelle zet de tafel al verslaat.
 		// Uitzondering: als geen naturelle zet bestaat (maxNaturalRank == 0 of ≤ tableRank),
 		// dan is de oversized combo soms de enige optie → bewaren.
-		if len(m.Cards) > round.Count && (hasWild || hasAce) && maxNaturalRank > tableRank {
+		if len(m.Cards) > round.Count && (hasWild || hasReset) && maxNaturalRank > tableRank {
 			continue // gefilterd: naturelle zet is efficiënter dan deze "/" combo
 		}
 		if !hasWild {
@@ -1605,12 +1616,12 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 		}
 		// Vanaf hier: zet bevat minstens één wildcard.
 
-		// Puur-wild (geen aas, geen normaal — bijv. joker+joker, 2+2):
+		// Puur-wild (geen reset, geen normaal — bijv. 2+2):
 		// een naturelle zet verslaat de tafel en spaart alle wildcards → filter.
-		if !hasNormal && !hasAce {
+		if !hasNormal && !hasReset {
 			continue // gefilterd: puur-wild gedomineerd door naturelle zetten
 		}
-		// Wild+aas (bijv. "2 1", "0 1") EN wild+normaal (bijv. "K 2", "Q 0"):
+		// Wild+joker (bijv. "2 0") EN wild+normaal (bijv. "K 2", "A 2"):
 		// beide gebruiken een wildcard. Alleen bewaren als de effectieve rank
 		// voldoende hoger is dan alle naturelle opties.
 		// Bij hoge naturelle ranks (≥10) is een 1-rank voordeel te klein:
@@ -1738,7 +1749,7 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 	myCards := gs.Hands[myID].Count()
 	oppCards := minOppHandCount(gs, myID)
 	shouldOverridePass := bestMove.IsPass && (myCards-oppCards >= 4 ||
-		(activePlayerCount(gs) <= 2 && oppCards < 9))
+		(activePlayerCount(gs) <= 2 && (oppCards < 9 || myCards >= oppCards)))
 	if shouldOverridePass {
 		bestNonPassKey := ""
 		bestNonPassWR := -1.0
@@ -1806,7 +1817,7 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 	myCards2 := gs.Hands[myID].Count()
 	oppCards2 := minOppHandCount(gs, myID)
 	if bestMove.IsPass && (myCards2-oppCards2 >= 4 ||
-		(activePlayerCount(gs) <= 2 && oppCards2 < 9)) {
+		(activePlayerCount(gs) <= 2 && (oppCards2 < 9 || myCards2 >= oppCards2))) {
 		if m, ok := bestNonPassFromDetails(eval.Details); ok {
 			for _, d := range eval.Details {
 				if MovesEqual(d.Move, m) {
@@ -1855,6 +1866,29 @@ func (e *Engine) determinize(gs *GameState, kt *KnowledgeTracker) *GameState {
 			} else {
 				tier3 = append(tier3, i)
 			}
+		}
+		// Sterke-kaarten-bias: ga er vanuit dat de tegenstander hoge naturelle kaarten
+		// en wildcards bezit (assen en tweetjes) — in alle spelfasen.
+		// Joker (reset) wordt NIET meer geprioriteerd: er zijn slechts 2 jokers in het
+		// hele deck. Statistisch heeft de tegenstander ~76% kans op minstens één joker
+		// als jij er geen hebt — dat is te laag om stelselmatig te assumeren.
+		// Aas (4 exemplaren) en Twee/wildcard (4 exemplaren) hebben wél een hoge
+		// kans (~84%) → die worden wel geprioriteerd in de determinisatie.
+		// Motivatie: spelers bewaren hun sterkste naturelle kaarten tot laat; het derde
+		// niet-gedealde pakje bevat relatief meer zwakke kaarten, dus de echte hand
+		// heeft verhoudingsgewijs meer sterke kaarten dan een willekeurige steekproef.
+		if need > 0 {
+			var strongFront, rest []int
+			for _, idx := range tier2 {
+				r := possible[idx].Rank
+				// Bias: Aas (hoogste naturelle kaart) en Twee (wildcard) vooraan
+				if r == RankAce || r == RankTwo {
+					strongFront = append(strongFront, idx)
+				} else {
+					rest = append(rest, idx)
+				}
+			}
+			tier2 = append(strongFront, rest...)
 		}
 		ordered := append(append(tier1, tier2...), tier3...)
 		if len(ordered) < need {
@@ -1948,6 +1982,78 @@ func (e *Engine) simulate(gs *GameState, myID int) float64 {
 			break
 		}
 		m := e.smartRandom(moves, sim)
+		// OmniscientMode rollout-verbetering:
+		// Wanneer smartRandom PASS kiest maar er speelbare zetten zijn, override:
+		//   - OPEN ronde: speel de ZWAKSTE kaart (dump goedkoop, bewaar sterke kaarten)
+		//   - RESPONSE ronde: speel alleen als er een NATURELLE (niet-wild, niet-joker)
+		//     respons is. Dit voorkomt dat rollouts wildcards/jokers verspillen op lage beats.
+		//     Kies de LAAGSTE naturelle respons (net genoeg om tafel te verslaan).
+		// Zo worden rollouts realistischer: spelers dumpen zwak in open rondes en
+		// verdedigen efficiënt in response rondes, zonder sterke kaarten te verspillen.
+		if e.Config.OmniscientMode && m.IsPass {
+			if sim.Round.IsOpen {
+				// Open ronde: dump zwakste kaart (laagste rank, geen specials)
+				var weakest Move
+				weakestRank := Rank(99)
+				found := false
+				for _, alt := range moves {
+					if alt.IsPass {
+						continue
+					}
+					// Prefer single normal cards for dumping
+					hasSpecial := false
+					for _, c := range alt.Cards {
+						if c.IsWild() || c.IsReset() {
+							hasSpecial = true
+							break
+						}
+					}
+					if hasSpecial {
+						continue // Skip zetten met wildcards/jokers
+					}
+					er := alt.EffectiveRank(sim.Round.TableRank)
+					if !found || er < weakestRank || (er == weakestRank && len(alt.Cards) > len(weakest.Cards)) {
+						weakestRank = er
+						weakest = alt
+						found = true
+					}
+				}
+				if found {
+					m = weakest
+				}
+			} else {
+				// Response ronde: alleen naturelle respons (geen wilds/jokers verspillen)
+				// Kies de laagste naturelle respons (net genoeg om tafel te verslaan)
+				var cheapest Move
+				cheapestRank := Rank(99)
+				found := false
+				for _, alt := range moves {
+					if alt.IsPass {
+						continue
+					}
+					hasSpecial := false
+					for _, c := range alt.Cards {
+						if c.IsWild() || c.IsReset() {
+							hasSpecial = true
+							break
+						}
+					}
+					if hasSpecial {
+						continue
+					}
+					er := alt.EffectiveRank(sim.Round.TableRank)
+					if !found || er < cheapestRank {
+						cheapestRank = er
+						cheapest = alt
+						found = true
+					}
+				}
+				if found {
+					m = cheapest
+				}
+				// Als alleen wild/joker beschikbaar is: laat PASS staan (bewaar specials)
+			}
+		}
 		sim.ApplyMove(m)
 	}
 	if sim.GameOver {
@@ -1993,18 +2099,19 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	}
 
 	curHand := gs.Hands[gs.CurrentTurn]
-	curWilds := curHand.CountRank(RankTwo) + curHand.CountRank(RankJoker)
-	curAces := curHand.CountRank(RankAce)
+	curWilds := curHand.CountRank(RankTwo)    // alleen 2 is wildcard
+	curResets := curHand.CountRank(RankJoker) // joker is reset-kaart
 	specialRatio := 0.0
 	if handCount > 0 {
-		specialRatio = float64(curWilds+curAces) / float64(handCount)
+		specialRatio = float64(curWilds+curResets) / float64(handCount)
 	}
 
 	// PASS CHANCE
 	passChance := wts.PassBase + specialRatio*wts.PassSpecialFactor
 
-	// Early-game pass bonus: alleen als speler NIET achterligt (gelijk of vooruit)
-	if handCount >= 8 {
+	// Early-game pass bonus: alleen bij 3+ spelers.
+	// In 2-speler is passen altijd gevaarlijk (tegenstander krijgt open ronde), dus nooit verhogen.
+	if handCount >= 8 && gs.activePlayerCount() > 2 {
 		for i, h := range gs.Hands {
 			if i != gs.CurrentTurn && !gs.Finished[i] {
 				if handCount <= h.Count() {
@@ -2038,7 +2145,8 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	if minOpp <= 5 && !gs.Round.IsOpen {
 		hasBeater := false
 		for _, c := range curHand.Cards {
-			if c.IsWild() || (!c.IsSpecial() && c.Rank > gs.Round.TableRank) {
+			// Joker (reset) is altijd een "beater" - reset de ronde en open opnieuw
+			if c.IsWild() || c.IsReset() || (!c.IsSpecial() && c.Rank > gs.Round.TableRank) {
 				hasBeater = true
 				break
 			}
@@ -2048,18 +2156,21 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		}
 	}
 
-	// 2-speler eindspel: PASS is bijna altijd catastrofaal.
-	// Tegenstander krijgt een vrije open ronde en kan zijn hele hand in één zet wegspelen.
-	// Drempel: tegenstander heeft < 9 kaarten = dodelijk gebied (7 kaarten = 1 zet gewonnen).
-	if minOpp < 9 {
-		activePlayers := 0
+	// 2-speler: PASS is in ALLE fases gevaarlijk — tegenstander krijgt vrije open ronde.
+	// Vroeg/midspel: 65% minder passen. Eindspel (<9 kaarten): 90% minder passen.
+	{
+		activePlayers2 := 0
 		for i, h := range gs.Hands {
 			if !gs.Finished[i] && h.Count() > 0 {
-				activePlayers++
+				activePlayers2++
 			}
 		}
-		if activePlayers <= 2 {
-			passChance *= 0.25 // 75% minder pasgedrag in 2-speler eindspel
+		if activePlayers2 <= 2 {
+			if minOpp < 9 {
+				passChance *= 0.10 // eindspel: vrijwel altijd fataal
+			} else {
+				passChance *= 0.35 // vroeg/midspel: ook gevaarlijk in 2-speler
+			}
 		}
 	}
 
@@ -2077,18 +2188,18 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	for i, m := range plays {
 		w := 1.0
 		wilds := 0
-		aces := 0
+		resets := 0
 		effective := m.EffectiveRank(gs.Round.TableRank)
 
 		for _, c := range m.Cards {
 			if c.IsWild() {
 				wilds++
-			} else if c.IsAce() {
-				aces++
+			} else if c.IsReset() {
+				resets++
 			}
 		}
 
-		w *= math.Pow(acePlayFactor, float64(aces))
+		w *= math.Pow(acePlayFactor, float64(resets))
 		w *= math.Pow(wildPlayFactor, float64(wilds))
 
 		// === WILD-VERSPIJLING STRAF ===
@@ -2113,7 +2224,7 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		// =====================================================
 
 		// Bonus voor dumpen van lage normale kaarten (4 4 krijgt voorkeur)
-		if wilds == 0 && aces == 0 && len(m.Cards) >= 1 {
+		if wilds == 0 && resets == 0 && len(m.Cards) >= 1 {
 			lowest := m.Cards[0].Rank
 			if lowest <= RankFive {
 				w *= 1.60
@@ -2122,22 +2233,37 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			}
 		}
 
-		if aces > 0 {
-			if gs.Round.IsOpen {
-				w *= 5.5
-			} else {
-				w *= 2.9
+		// Singleton dump vs cluster-breek: bij een single-antwoord op een single tafel,
+		// sterk voorkeur voor kaarten waarvan je er maar 1 hebt (geïsoleerde kaarten).
+		// Straf als je een paar of triple moet breken voor een enkele kaart.
+		if wilds == 0 && resets == 0 && !gs.Round.IsOpen &&
+			len(m.Cards) == 1 && gs.Round.Count == 1 {
+			rankCount := curHand.CountRank(effective)
+			if rankCount == 1 {
+				w *= 2.2 // singleton: wil je kwijt, speelt niet uit cluster
+			} else if rankCount >= 2 {
+				w *= 0.55 // breekt paar of triple: minder wenselijk
 			}
 		}
-		if aces > 0 && wilds > 0 && gs.Round.IsOpen {
+
+		if resets > 0 {
+			if gs.Round.IsOpen {
+				w *= 5.5 // joker reset in open ronde: extreem sterk
+			} else {
+				w *= 2.9 // joker reset als antwoord: sterk maar kostbaar
+			}
+		}
+		if resets > 0 && wilds > 0 && gs.Round.IsOpen {
 			w *= 2.1
 		}
 
-		if aces > 0 && wilds > 0 {
+		if resets > 0 && wilds > 0 {
 			w *= synergyPenalty
 		}
 
 		for _, c := range m.Cards {
+			// !IsSpecial() includes Ace now (natural card), but Ace has high rank
+			// The formula rewards LOW ranks; Ace (14) gets slight penalty = correct
 			if !c.IsSpecial() {
 				w *= 1.0 + wts.RankPreference*(13.0-float64(c.Rank))
 			}
@@ -2185,37 +2311,44 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 	}
 
 	hand := gs.Hands[myID]
-	wilds := hand.CountRank(RankTwo) + hand.CountRank(RankJoker)
-	aces := hand.CountRank(RankAce)
-	score += float64(aces) * wts.AceBonus
+	wilds := hand.CountRank(RankTwo)    // alleen 2 is wildcard
+	resets := hand.CountRank(RankJoker) // joker is reset-kaart
+	score += float64(resets) * wts.AceBonus  // joker is nu de reset = voormalige aas-bonus
 	score += float64(wilds) * wts.WildBonus
-	if aces > 0 && wilds > 0 {
-		score += float64(imin(aces, wilds)) * wts.SynergyBonus
+	if resets > 0 && wilds > 0 {
+		score += float64(imin(resets, wilds)) * wts.SynergyBonus
 	}
 	kings := hand.CountRank(RankKing)
-	if kings > 0 && wilds == 0 && aces == 0 {
+	if kings > 0 && wilds == 0 && resets == 0 {
 		score -= float64(kings) * wts.KingPenalty
 	}
 	queens := hand.CountRank(RankQueen)
-	if queens > 0 && wilds == 0 && aces == 0 {
+	if queens > 0 && wilds == 0 && resets == 0 {
 		score -= float64(queens) * wts.QueenPenalty
 	}
+	// Geïsoleerde lage kaarten (3-7): moeilijk te dumpen als single
 	for r := RankThree; r <= RankSeven; r++ {
 		if hand.CountRank(r) == 1 && wilds == 0 {
 			score -= wts.IsolatedLowPenalty
 		}
 	}
-	for r := RankThree; r <= RankKing; r++ {
+	// Geïsoleerde midden-kaarten (8-X): ook lastig, maar iets minder erg
+	for r := RankEight; r <= RankTen; r++ {
+		if hand.CountRank(r) == 1 && wilds == 0 {
+			score -= wts.IsolatedLowPenalty * 0.5
+		}
+	}
+	for r := RankThree; r <= RankAce; r++ {
 		cnt := hand.CountRank(r)
 		if cnt >= 2 {
 			score += float64(cnt-1) * wts.ClusterBonus
 		}
 	}
-	// Tempo + Ace in open ronde = extreem sterk
+	// Tempo + Joker (reset) in open ronde = extreem sterk
 	if gs.Round.IsOpen && gs.CurrentTurn == myID {
 		score += wts.TempoBonus * 4.0
-		if hand.CountAces() > 0 {
-			score += 0.45 // Zeer zware bonus voor Ace + extra beurt
+		if hand.CountResets() > 0 {
+			score += 0.45 // Zeer zware bonus voor Joker + extra beurt
 		}
 	}
 	if score < 0 {
@@ -2230,11 +2363,7 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 func (e *Engine) backprop(node *mctsNode, result float64, myID int) {
 	for node != nil {
 		node.visits++
-		if node.playerID == myID {
-			node.wins += result
-		} else if node.playerID >= 0 {
-			node.wins += 1.0 - result
-		}
+		node.wins += result // Altijd vanuit myID-perspectief: ucb1Select inverteeert voor tegenstanders.
 		node = node.parent
 	}
 }
@@ -2862,8 +2991,8 @@ func playMode(reader *Reader, cfg settings) {
 	}
 	tracker := NewKnowledgeTracker(numPlayers, myPlayer, hands[myPlayer], deadCards)
 	gs := NewGameWithHands(hands, deadCards, 0)
-	iters := 5000
-	if n, err := reader.ReadInt("Engine-iteraties per zet (standaard 5000, meer = nauwkeuriger maar trager): "); err == nil && n > 0 {
+	iters := 10000
+	if n, err := reader.ReadInt("Engine-iteraties per zet (standaard 10000, meer = nauwkeuriger maar trager): "); err == nil && n > 0 {
 		iters = n
 	}
 	engConfig := DefaultConfig(numPlayers)
@@ -3144,7 +3273,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 			eng := NewEngine(engConfig)
 			bestMove, bestEval = eng.BestMove(gs, tracker)
 			bestLabel = FormatMove(bestMove)
-			if bestMove.ContainsAce() {
+			if bestMove.ContainsReset() {
 				gsClone := gs.Clone()
 				gsClone.ApplyMove(bestMove)
 				if !gsClone.GameOver && gsClone.CurrentTurn == playerID {
@@ -3328,7 +3457,7 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			eng := NewEngine(engConfig)
 			bestMove, bestEval = eng.BestMove(gs, tracker)
 			bestLabel = FormatMove(bestMove)
-			if bestMove.ContainsAce() {
+			if bestMove.ContainsReset() {
 				gsClone := gs.Clone()
 				gsClone.ApplyMove(bestMove)
 				if !gsClone.GameOver && gsClone.CurrentTurn == playerID {
