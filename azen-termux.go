@@ -1040,10 +1040,12 @@ func (kt *KnowledgeTracker) RecordPass(passerID int, round RoundState) {
 	if round.IsOpen {
 		return
 	}
-	if kt.HandCounts[passerID] >= 9 {
+	// Alleen loggen bij ≤12 kaarten; bij heel veel kaarten is passen nog strategisch
+	if kt.HandCounts[passerID] > 12 {
 		return
 	}
-	if round.Count != 1 {
+	// Accepteer zowel singles als pairs — wie past op een pair heeft dat pair niet
+	if round.Count < 1 || round.Count > 2 {
 		return
 	}
 	kt.PassRecords[passerID] = append(kt.PassRecords[passerID], PassRecord{
@@ -1121,11 +1123,24 @@ func (kt *KnowledgeTracker) ClearExclusions(playerID int) {
 func (kt *KnowledgeTracker) ExcludedRanks(playerID int) map[Rank]bool {
 	excluded := map[Rank]bool{}
 	for _, pr := range kt.PassRecords[playerID] {
-		excluded[RankJoker] = true // joker reset: als je er een had, had je gereset
-		excluded[RankTwo] = true   // wildcard: als je er genoeg had, had je gespeeld
-		for _, r := range NormalRanks() {
-			if r > pr.TableRank {
-				excluded[r] = true
+		// Joker: bij een pass op single altijd reset-mogelijkheid gemist → exclude.
+		// Bij pair: joker helpt niet direct → niet excluden.
+		if pr.Count == 1 {
+			excluded[RankJoker] = true
+		}
+		// Wildcard (2): alleen excluden bij hoge tafel (≥ Queen).
+		// Bij lage tafel is het slim om wild te bewaren — geen bewijs dat je er geen hebt.
+		if pr.Count == 1 && pr.TableRank >= RankQueen {
+			excluded[RankTwo] = true
+		}
+		// Bij single-pass: sluit hogere ranks uit (ze hadden die kunnen spelen)
+		// Bij pair-pass: NIET excluden — ze kunnen singles van hoge ranks hebben,
+		// alleen geen PAIRS. De exclusie-map is binair en kan dat onderscheid niet maken.
+		if pr.Count == 1 {
+			for _, r := range NormalRanks() {
+				if r > pr.TableRank {
+					excluded[r] = true
+				}
 			}
 		}
 	}
@@ -1547,10 +1562,14 @@ func findImmediateWin(gs *GameState) *Move {
 	for _, h := range gs.Hands {
 		totalCards += h.Count()
 	}
-	if totalCards > 10 {
+	if totalCards > 12 {
 		return nil // te veel kaarten, minimax te duur
 	}
-	maxDepth := totalCards * 4 // ruimte voor pass-sequenties
+	// Adaptieve diepte: bij meer kaarten minder diep zoeken (bredere boom)
+	maxDepth := totalCards * 3
+	if totalCards <= 8 {
+		maxDepth = totalCards * 4
+	}
 	nodes := 0
 
 	// Probeer niet-pass zetten eerst (sneller naar winst)
@@ -2038,7 +2057,26 @@ func (e *Engine) selectExpand(node *mctsNode, gs *GameState, myID int, rootFilte
 		}
 		unexplored := e.unexploredMoves(node, moves)
 		if len(unexplored) > 0 {
-			m := unexplored[e.rng.Intn(len(unexplored))]
+			// Move ordering: kies de best-beoordeelde onverkende zet
+			// i.p.v. willekeurig. QuickEvaluateMove geeft heuristische score.
+			m := unexplored[0]
+			if len(unexplored) > 1 {
+				bestScore := -999.0
+				for _, um := range unexplored {
+					var sc float64
+					if um.IsPass {
+						sc = -1.0
+					} else {
+						sc = QuickEvaluateMove(simGS, um).Score
+					}
+					// Kleine random tiebreak zodat gelijke zetten niet altijd dezelfde volgorde hebben
+					sc += e.rng.Float64() * 0.5
+					if sc > bestScore {
+						bestScore = sc
+						m = um
+					}
+				}
+			}
 			child := &mctsNode{move: m, parent: node, playerID: m.PlayerID}
 			node.children = append(node.children, child)
 			simGS.ApplyMove(m)
@@ -2096,78 +2134,32 @@ func (e *Engine) simulate(gs *GameState, myID int) float64 {
 		if len(moves) == 0 {
 			break
 		}
-		m := e.smartRandom(moves, sim)
-		// OmniscientMode rollout-verbetering:
-		// Wanneer smartRandom PASS kiest maar er speelbare zetten zijn, override:
-		//   - OPEN ronde: speel de ZWAKSTE kaart (dump goedkoop, bewaar sterke kaarten)
-		//   - RESPONSE ronde: speel alleen als er een NATURELLE (niet-wild, niet-joker)
-		//     respons is. Dit voorkomt dat rollouts wildcards/jokers verspillen op lage beats.
-		//     Kies de LAAGSTE naturelle respons (net genoeg om tafel te verslaan).
-		// Zo worden rollouts realistischer: spelers dumpen zwak in open rondes en
-		// verdedigen efficiënt in response rondes, zonder sterke kaarten te verspillen.
-		if e.Config.OmniscientMode && m.IsPass {
-			if sim.Round.IsOpen {
-				// Open ronde: dump zwakste kaart (laagste rank, geen specials)
-				var weakest Move
-				weakestRank := Rank(99)
-				found := false
+		var m Move
+		if e.Config.OmniscientMode {
+			// OmniscientMode rollout: 70% greedy (QuickEvaluateMove), 30% smartRandom.
+			// De greedy component kijkt naar zetwaarde (win threats, wild-verspilling,
+			// rank-kwaliteit). De random component zorgt voor exploratie-diversiteit
+			// zodat rollouts niet te deterministisch worden.
+			if e.rng.Float64() < 0.7 {
+				m = moves[0]
+				bestQScore := -999.0
 				for _, alt := range moves {
+					var sc float64
 					if alt.IsPass {
-						continue
+						sc = -1.0
+					} else {
+						sc = QuickEvaluateMove(sim, alt).Score
 					}
-					// Prefer single normal cards for dumping
-					hasSpecial := false
-					for _, c := range alt.Cards {
-						if c.IsWild() || c.IsReset() {
-							hasSpecial = true
-							break
-						}
+					if sc > bestQScore {
+						bestQScore = sc
+						m = alt
 					}
-					if hasSpecial {
-						continue // Skip zetten met wildcards/jokers
-					}
-					er := alt.EffectiveRank(sim.Round.TableRank)
-					if !found || er < weakestRank || (er == weakestRank && len(alt.Cards) > len(weakest.Cards)) {
-						weakestRank = er
-						weakest = alt
-						found = true
-					}
-				}
-				if found {
-					m = weakest
 				}
 			} else {
-				// Response ronde: alleen naturelle respons (geen wilds/jokers verspillen)
-				// Kies de laagste naturelle respons (net genoeg om tafel te verslaan)
-				var cheapest Move
-				cheapestRank := Rank(99)
-				found := false
-				for _, alt := range moves {
-					if alt.IsPass {
-						continue
-					}
-					hasSpecial := false
-					for _, c := range alt.Cards {
-						if c.IsWild() || c.IsReset() {
-							hasSpecial = true
-							break
-						}
-					}
-					if hasSpecial {
-						continue
-					}
-					er := alt.EffectiveRank(sim.Round.TableRank)
-					if !found || er < cheapestRank {
-						cheapestRank = er
-						cheapest = alt
-						found = true
-					}
-				}
-				if found {
-					m = cheapest
-				}
-				// Als alleen wild/joker beschikbaar is: laat PASS staan (bewaar specials)
+				m = e.smartRandom(moves, sim)
 			}
+		} else {
+			m = e.smartRandom(moves, sim)
 		}
 		sim.ApplyMove(m)
 	}
