@@ -1525,16 +1525,108 @@ func (md MoveDetail) String() string {
 	return fmt.Sprintf("  %s -> %.1f%% (%d visits)", md.Move, md.WinRate*100, md.Visits)
 }
 
+// findImmediateWin zoekt naar een gegarandeerde winnende zet ("schaakmat")
+// via minimax. Bij ≤10 totale kaarten doorzoekt het ALLE mogelijke antwoorden
+// van de tegenstander. Als er een pad is waar wij ALTIJD winnen ongeacht
+// tegenstander-reacties, retourneert het de eerste zet van dat pad.
 func findImmediateWin(gs *GameState) *Move {
 	pid := gs.CurrentTurn
 	handCount := gs.Hands[pid].Count()
-	for _, m := range gs.GetLegalMoves() {
+	moves := gs.GetLegalMoves()
+
+	// Snelle check: 1-zet win (geen Clone nodig)
+	for _, m := range moves {
 		if !m.IsPass && len(m.Cards) == handCount {
 			mv := m
 			return &mv
 		}
 	}
+
+	// Minimax forced-win zoektocht voor diepere schaakmatten
+	totalCards := 0
+	for _, h := range gs.Hands {
+		totalCards += h.Count()
+	}
+	if totalCards > 10 {
+		return nil // te veel kaarten, minimax te duur
+	}
+	maxDepth := totalCards * 4 // ruimte voor pass-sequenties
+	nodes := 0
+
+	// Probeer niet-pass zetten eerst (sneller naar winst)
+	for _, m := range moves {
+		if m.IsPass {
+			continue
+		}
+		sim := gs.Clone()
+		sim.ApplyMove(m)
+		if sim.GameOver && sim.Winner == pid {
+			mv := m
+			return &mv
+		}
+		if forcedWinSearch(sim, pid, maxDepth-1, &nodes, 500000) {
+			mv := m
+			return &mv
+		}
+	}
 	return nil
+}
+
+// forcedWinSearch bepaalt via minimax of de huidige positie een gedwongen
+// winst is voor myID. Bij onze beurt: minstens 1 zet moet forceren.
+// Bij tegenstander: ALLE antwoorden moeten naar onze winst leiden.
+func forcedWinSearch(gs *GameState, myID int, depth int, nodes *int, maxNodes int) bool {
+	*nodes++
+	if *nodes > maxNodes {
+		return false
+	}
+	if gs.GameOver {
+		return gs.Winner == myID
+	}
+	if depth <= 0 {
+		return false
+	}
+
+	moves := gs.GetLegalMoves()
+
+	if gs.CurrentTurn == myID {
+		// Onze beurt: minstens 1 zet moet naar gedwongen winst leiden
+		// Probeer speel-zetten eerst (efficiënter dan PASS)
+		for _, m := range moves {
+			if m.IsPass {
+				continue
+			}
+			sim := gs.Clone()
+			sim.ApplyMove(m)
+			if forcedWinSearch(sim, myID, depth-1, nodes, maxNodes) {
+				return true
+			}
+		}
+		// PASS alleen in response-rondes (in open ronde altijd speelbare kaarten)
+		if !gs.Round.IsOpen {
+			for _, m := range moves {
+				if !m.IsPass {
+					continue
+				}
+				sim := gs.Clone()
+				sim.ApplyMove(m)
+				if forcedWinSearch(sim, myID, depth-1, nodes, maxNodes) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Tegenstander: ALLE zetten moeten naar onze winst leiden
+	for _, m := range moves {
+		sim := gs.Clone()
+		sim.ApplyMove(m)
+		if !forcedWinSearch(sim, myID, depth-1, nodes, maxNodes) {
+			return false
+		}
+	}
+	return true
 }
 
 type workerResult struct {
@@ -1739,6 +1831,29 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		if v > bestVisits {
 			bestVisits = v
 			bestKey = k
+		}
+	}
+	// OmniscientMode (analyse): selecteer op WINRATE in plaats van visits.
+	// In OmniscientMode bouwen alle workers dezelfde boom, maar PASS kan door
+	// boom-asymmetrie (bredere subtree) meer visits krijgen ondanks lagere winrate.
+	// Selectie op winrate geeft nauwkeurigere analyse-resultaten.
+	// Eis: minstens 5% van totaal bezoeken, zodat noisy low-visit zetten niet winnen.
+	if e.Config.OmniscientMode {
+		totalIters := 0
+		for _, v := range totalVisits {
+			totalIters += v
+		}
+		minVisits := totalIters / 20 // minstens 5% van totaal
+		bestWR := -1.0
+		for k, v := range totalVisits {
+			if v >= minVisits {
+				wr := totalWins[k] / float64(v)
+				if wr > bestWR {
+					bestWR = wr
+					bestKey = k
+					bestVisits = v
+				}
+			}
 		}
 	}
 	bestMove := moveMap[bestKey]
@@ -2344,11 +2459,15 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 			score += float64(cnt-1) * wts.ClusterBonus
 		}
 	}
-	// Tempo + Joker (reset) in open ronde = extreem sterk
+	// Tempo: open ronde op je beurt is een voordeel, maar proportioneel —
+	// niet zo groot dat het kaartdifferentieel overschaduwt.
+	// Oude waarde (4.0x = 0.34 + 0.45 voor Joker = 0.79!) was absurd groot
+	// en maakte dat PASS kunstmatig goed scoorde in MCTS rollouts,
+	// omdat rolloutevaluaties met open-ronde-posities altijd ~1.0 teruggaven.
 	if gs.Round.IsOpen && gs.CurrentTurn == myID {
-		score += wts.TempoBonus * 4.0
+		score += wts.TempoBonus * 1.2 // 0.085*1.2 = ~0.10 (was 0.34)
 		if hand.CountResets() > 0 {
-			score += 0.45 // Zeer zware bonus voor Joker + extra beurt
+			score += 0.08 // was 0.45 — joker+tempo is sterk maar niet allesbepalend
 		}
 	}
 	if score < 0 {
@@ -2373,11 +2492,33 @@ func (e *Engine) pickBest(root *mctsNode, myID int) (Move, MoveEval) {
 		return PassMove(myID), MoveEval{}
 	}
 	var bestNode *mctsNode
-	bestV := -1
-	for _, ch := range root.children {
-		if ch.visits > bestV {
-			bestV = ch.visits
-			bestNode = ch
+	if e.Config.OmniscientMode {
+		// OmniscientMode (analyse): selecteer op winrate, niet op visits.
+		// Eis: minstens 5% van root visits, zodat noisy low-visit zetten niet winnen.
+		totalV := 0
+		for _, ch := range root.children {
+			totalV += ch.visits
+		}
+		minV := totalV / 20
+		bestWR := -1.0
+		for _, ch := range root.children {
+			if ch.visits >= minV {
+				wr := ch.wins / float64(ch.visits)
+				if wr > bestWR {
+					bestWR = wr
+					bestNode = ch
+				}
+			}
+		}
+	}
+	if bestNode == nil {
+		// Fallback (of non-OmniscientMode): selecteer op visits
+		bestV := -1
+		for _, ch := range root.children {
+			if ch.visits > bestV {
+				bestV = ch.visits
+				bestNode = ch
+			}
 		}
 	}
 	wr := 0.0
@@ -2399,7 +2540,7 @@ func (e *Engine) pickBest(root *mctsNode, myID int) (Move, MoveEval) {
 			}
 		}
 	}
-	return bestNode.move, MoveEval{Score: wr, Visits: bestV, Details: details}
+	return bestNode.move, MoveEval{Score: wr, Visits: bestNode.visits, Details: details}
 }
 
 // minOppHandCount geeft het laagste kaartaantal van actieve tegenstanders.
@@ -3014,8 +3155,12 @@ func playMode(reader *Reader, cfg settings) {
 			PrintCards(gs.Hands[myPlayer])
 			fmt.Println("\n🤔 Engine denkt na...")
 			bestMove, eval := eng.BestMove(gs, tracker)
-			fmt.Printf("\n💡 Engine suggereert: %s (winst: %s)\n\n",
-				FormatMove(bestMove), FormatScore(eval.Score))
+			if eval.Score >= 1.0 && eval.Visits <= 1 {
+				fmt.Printf("\n♟️  Gedwongen winst gevonden: %s\n\n", FormatMove(bestMove))
+			} else {
+				fmt.Printf("\n💡 Engine suggereert: %s (winst: %s)\n\n",
+					FormatMove(bestMove), FormatScore(eval.Score))
+			}
 			for {
 				input := reader.ReadLine("Jouw zet (of 'hint'/'rethink'/'help'/'hand'/'status'/'moves'/'gok'): ")
 				lower := strings.ToLower(input)
@@ -3032,8 +3177,12 @@ func playMode(reader *Reader, cfg settings) {
 				case "rethink":
 					fmt.Println("\n🤔 Engine herdenkt de situatie...")
 					bestMove, eval = eng.BestMove(gs, tracker)
-					fmt.Printf("\n💡 Nieuwe suggestie: %s (winst: %s)\n\n",
-						FormatMove(bestMove), FormatScore(eval.Score))
+					if eval.Score >= 1.0 && eval.Visits <= 1 {
+						fmt.Printf("\n♟️  Gedwongen winst gevonden: %s\n\n", FormatMove(bestMove))
+					} else {
+						fmt.Printf("\n💡 Nieuwe suggestie: %s (winst: %s)\n\n",
+							FormatMove(bestMove), FormatScore(eval.Score))
+					}
 					continue
 				case "hint":
 					fmt.Printf("💡 Suggestie: %s (winst: %s)\n",
@@ -3327,23 +3476,62 @@ func analyzeMode(reader *Reader, cfg settings) {
 			}
 		}
 		if doAnalysis {
+			forcedWin := bestEval.Score >= 1.0 && bestEval.Visits <= 1
 			playedIsBest := MovesEqual(bestMove, move)
 			var diff float64
 			emoji := "✅"
 			if !playedIsBest {
 				diff = bestEval.Score - actualDetail.WinRate
-				if diff > 0.15 {
+				if forcedWin {
 					emoji = "❌"
-				} else if diff > 0.05 {
+				} else if diff > 0.15 {
+					emoji = "❌"
+				} else if diff > 0.02 {
 					emoji = "⚠️ "
 				}
 			}
 			fmt.Printf("%s Gespeeld: %s (score: %.1f%%)\n", emoji, moveLabel, actualDetail.WinRate*100)
-			showBest := !playedIsBest &&
-				(diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
-			if showBest {
-				fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
-					bestLabel, bestEval.Score*100, diff*100)
+			if forcedWin && !playedIsBest {
+				fmt.Printf("   ♟️  Gedwongen winst gemist! Beste was: %s\n", bestLabel)
+			} else if forcedWin && playedIsBest {
+				fmt.Printf("   ♟️  Gedwongen winst gevonden!\n")
+			} else {
+				showBest := !playedIsBest &&
+					(diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
+				if showBest {
+					fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
+						bestLabel, bestEval.Score*100, diff*100)
+				}
+			}
+			// Diagnostiek: toon top alternatieven (gesorteerd op score, max 5)
+			if len(bestEval.Details) > 1 {
+				sorted := make([]MoveDetail, len(bestEval.Details))
+				copy(sorted, bestEval.Details)
+				for i := 0; i < len(sorted); i++ {
+					for j := i + 1; j < len(sorted); j++ {
+						if sorted[j].WinRate > sorted[i].WinRate {
+							sorted[i], sorted[j] = sorted[j], sorted[i]
+						}
+					}
+				}
+				fmt.Printf("   Top: ")
+				limit := len(sorted)
+				if limit > 5 {
+					limit = 5
+				}
+				for k := 0; k < limit; k++ {
+					d := sorted[k]
+					label := FormatMove(d.Move)
+					marker := ""
+					if MovesEqual(d.Move, move) {
+						marker = "←"
+					}
+					if k > 0 {
+						fmt.Printf(" | ")
+					}
+					fmt.Printf("%s %.1f%%%s", label, d.WinRate*100, marker)
+				}
+				fmt.Println()
 			}
 		} else {
 			fmt.Printf("⏭️  Speler %d: %s\n", playerID+1, moveLabel)
@@ -3510,22 +3698,61 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			}
 		}
 		if doAnalysis {
+			forcedWin := bestEval.Score >= 1.0 && bestEval.Visits <= 1
 			playedIsBest := MovesEqual(bestMove, move)
 			var diff float64
 			emoji := "✅"
 			if !playedIsBest {
 				diff = bestEval.Score - actualDetail.WinRate
-				if diff > 0.15 {
+				if forcedWin {
 					emoji = "❌"
-				} else if diff > 0.05 {
+				} else if diff > 0.15 {
+					emoji = "❌"
+				} else if diff > 0.02 {
 					emoji = "⚠️ "
 				}
 			}
 			fmt.Printf("%s Z%d P%d: %s (score: %.1f%%)\n", emoji, moveNum, playerID+1, moveLabel, actualDetail.WinRate*100)
-			showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
-			if showBest {
-				fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
-					bestLabel, bestEval.Score*100, diff*100)
+			if forcedWin && !playedIsBest {
+				fmt.Printf("   ♟️  Gedwongen winst gemist! Beste was: %s\n", bestLabel)
+			} else if forcedWin && playedIsBest {
+				fmt.Printf("   ♟️  Gedwongen winst gevonden!\n")
+			} else {
+				showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
+				if showBest {
+					fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
+						bestLabel, bestEval.Score*100, diff*100)
+				}
+			}
+			// Diagnostiek: toon top alternatieven (gesorteerd op score, max 5)
+			if len(bestEval.Details) > 1 {
+				sorted := make([]MoveDetail, len(bestEval.Details))
+				copy(sorted, bestEval.Details)
+				for i := 0; i < len(sorted); i++ {
+					for j := i + 1; j < len(sorted); j++ {
+						if sorted[j].WinRate > sorted[i].WinRate {
+							sorted[i], sorted[j] = sorted[j], sorted[i]
+						}
+					}
+				}
+				fmt.Printf("   Top: ")
+				limit := len(sorted)
+				if limit > 5 {
+					limit = 5
+				}
+				for k := 0; k < limit; k++ {
+					d := sorted[k]
+					label := FormatMove(d.Move)
+					marker := ""
+					if MovesEqual(d.Move, move) {
+						marker = "←"
+					}
+					if k > 0 {
+						fmt.Printf(" | ")
+					}
+					fmt.Printf("%s %.1f%%%s", label, d.WinRate*100, marker)
+				}
+				fmt.Println()
 			}
 		} else {
 			fmt.Printf("⏭️  Z%d P%d: %s\n", moveNum, playerID+1, moveLabel)
