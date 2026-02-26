@@ -1455,8 +1455,11 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 		mq.Score -= overshoot * 3.0 // bijv. Queen op een 6 tafel = -15 (overshoot 5)
 	}
 
-	// Open ronde: lage kaarten dumpen is goed.
-	if gs.Round.IsOpen && effectiveRank > 0 {
+	// Open ronde: lage kaarten dumpen is goed — MAAR alleen als je daarna
+	// nog ≥3 kaarten overhoudt. Als je na de zet ≤2 kaarten overhoudt, is
+	// het spelen van hoge kaarten (bijv. QQQ) juist de WIN-strategie en moet
+	// de straf onderdrukt worden (anders wint "5" onterecht van "QQQ").
+	if gs.Round.IsOpen && effectiveRank > 0 && cardsAfter >= 3 {
 		rankValue := float64(effectiveRank-RankThree) / float64(RankAce-RankThree)
 		mq.Score -= rankValue * 8.0 // hoge kaarten in open ronde = verspilling
 	}
@@ -1474,9 +1477,21 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 		}
 	}
 
-	if cardsAfter <= 3 {
-		mq.Score += 15.0
+	// Win-threat bonus: schaalbaar naargelang hoeveel kaarten er overblijven.
+	// Hoe dichter bij winst, hoe groter de bonus — zodat QQQ (1 kaart over)
+	// duidelijk wint van 5 (3 kaarten over) in de heuristische evaluatie.
+	switch {
+	case cardsAfter == 1:
+		mq.Score += 25.0
 		mq.CreatesWinThreat = true
+	case cardsAfter == 2:
+		mq.Score += 18.0
+		mq.CreatesWinThreat = true
+	case cardsAfter == 3:
+		mq.Score += 10.0
+		mq.CreatesWinThreat = true
+	case cardsAfter == 4:
+		mq.Score += 4.0
 	}
 	if gs.Round.IsOpen && resetsUsed > 0 {
 		mq.Score += 10.0
@@ -1584,7 +1599,7 @@ func (md MoveDetail) String() string {
 // via minimax. Bij ≤12 totale kaarten doorzoekt het ALLE mogelijke antwoorden
 // van de tegenstander. Retourneert de eerste zet van het winnende pad en het
 // aantal eigen beurten tot winst (1 = directe win, 2 = 2-staps combo, etc.).
-func findImmediateWin(gs *GameState) (*Move, int) {
+func findImmediateWin(gs *GameState, knownHands bool) (*Move, int) {
 	pid := gs.CurrentTurn
 	handCount := gs.Hands[pid].Count()
 	moves := gs.GetLegalMoves()
@@ -1595,6 +1610,14 @@ func findImmediateWin(gs *GameState) (*Move, int) {
 			mv := m
 			return &mv, 1
 		}
+	}
+
+	// Minimax forced-win zoektocht is alleen betrouwbaar als alle handen
+	// bekend zijn (OmniscientMode / analyse). In play-mode bevatten de
+	// tegenstander-handen placeholder-kaarten (rank 0) die nooit kunnen
+	// antwoorden, waardoor elke zet vals als gedwongen winst wordt gezien.
+	if !knownHands {
+		return nil, 0
 	}
 
 	// Minimax forced-win zoektocht voor diepere schaakmatten
@@ -1863,7 +1886,7 @@ func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed 
 }
 
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
-	if win, depth := findImmediateWin(gs); win != nil {
+	if win, depth := findImmediateWin(gs, e.Config.OmniscientMode); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
 	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
@@ -2218,29 +2241,30 @@ func (e *Engine) simulate(gs *GameState, myID int) float64 {
 		if len(moves) == 0 {
 			break
 		}
+		// Greedy/random rollout: QuickEvaluateMove kiest de best-beoordeelde zet
+		// (overshoot-penalty, wild-straf, paar-breek, win-threats). De random
+		// component (smartRandom) zorgt voor diversiteit.
+		// OmniscientMode: 70/30 greedy/random (sterkere heuristiek bij bekende handen)
+		// Play mode: 40/60 greedy/random (meer diversiteit bij onbekende handen)
 		var m Move
+		greedyThreshold := 0.4
 		if e.Config.OmniscientMode {
-			// OmniscientMode rollout: 70% greedy (QuickEvaluateMove), 30% smartRandom.
-			// De greedy component kijkt naar zetwaarde (win threats, wild-verspilling,
-			// rank-kwaliteit). De random component zorgt voor exploratie-diversiteit
-			// zodat rollouts niet te deterministisch worden.
-			if e.rng.Float64() < 0.7 {
-				m = moves[0]
-				bestQScore := -999.0
-				for _, alt := range moves {
-					var sc float64
-					if alt.IsPass {
-						sc = -1.0
-					} else {
-						sc = QuickEvaluateMove(sim, alt).Score
-					}
-					if sc > bestQScore {
-						bestQScore = sc
-						m = alt
-					}
+			greedyThreshold = 0.7
+		}
+		if e.rng.Float64() < greedyThreshold {
+			m = moves[0]
+			bestQScore := -999.0
+			for _, alt := range moves {
+				var sc float64
+				if alt.IsPass {
+					sc = -1.0
+				} else {
+					sc = QuickEvaluateMove(sim, alt).Score
 				}
-			} else {
-				m = e.smartRandom(moves, sim)
+				if sc > bestQScore {
+					bestQScore = sc
+					m = alt
+				}
 			}
 		} else {
 			m = e.smartRandom(moves, sim)
@@ -2414,8 +2438,11 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		}
 		// =====================================================
 
-		// Bonus voor dumpen van lage normale kaarten (4 4 krijgt voorkeur)
-		if wilds == 0 && resets == 0 && len(m.Cards) >= 1 {
+		// Bonus voor dumpen van lage normale kaarten (4 4 krijgt voorkeur).
+		// ONDERDRUK in eindspel (≤2 kaarten over): dan geldt STRATEGIE, niet dumporde.
+		// Bijv. {3,K,K}: KK spelen (cardsAfter=1) is beter dan 3 spelen (cardsAfter=2).
+		cardsAfterM := handCount - len(m.Cards)
+		if wilds == 0 && resets == 0 && len(m.Cards) >= 1 && cardsAfterM > 2 {
 			lowest := m.Cards[0].Rank
 			if lowest <= RankFive {
 				w *= 1.60
@@ -2425,13 +2452,20 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		}
 
 		// Singleton dump vs cluster-breek: bij een single-antwoord op een single tafel,
-		// sterk voorkeur voor kaarten waarvan je er maar 1 hebt (geïsoleerde kaarten).
+		// sterk voorkeur voor LAGE kaarten waarvan je er maar 1 hebt (geïsoleerde kaarten).
 		// Straf als je een paar of triple moet breken voor een enkele kaart.
+		// MAAR: hoge singletons (Aas, Heer) zijn waardevol en moeten bewaard worden!
 		if wilds == 0 && resets == 0 && !gs.Round.IsOpen &&
 			len(m.Cards) == 1 && gs.Round.Count == 1 {
 			rankCount := curHand.CountRank(effective)
 			if rankCount == 1 {
-				w *= 2.2 // singleton: wil je kwijt, speelt niet uit cluster
+				if effective >= RankAce {
+					w *= 0.30 // Aas-singleton: BEWAREN, niet dumpen — uniek sterk
+				} else if effective >= RankKing {
+					w *= 0.60 // Heer-singleton: mild bewaren
+				} else {
+					w *= 2.2 // lage singleton: wil je kwijt
+				}
 			} else if rankCount >= 2 {
 				w *= 0.55 // breekt paar of triple: minder wenselijk
 			}
@@ -2458,6 +2492,34 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			if !c.IsSpecial() {
 				w *= 1.0 + wts.RankPreference*(13.0-float64(c.Rank))
 			}
+		}
+
+		// Response-overshoot: in response-rondes de LAAGSTE winnende zet prefereren.
+		// KK op een X-tafel is verspilling als JJ of QQ ook wint.
+		// Exponentiële afname: elke rank boven het minimum kost ~15% gewicht.
+		if !gs.Round.IsOpen && wilds == 0 && resets == 0 && effective > gs.Round.TableRank {
+			overshoot := float64(effective-gs.Round.TableRank) - 1.0
+			if overshoot > 0 {
+				w *= math.Pow(0.85, overshoot)
+			}
+		}
+
+		// Aas-bescherming: Aas niet verspillen op lage tafel als goedkopere opties bestaan.
+		// De Aas is het ultieme wapen tegen Heer/Aas van de tegenstander.
+		if effective == RankAce && !gs.Round.IsOpen && gs.Round.TableRank <= RankJack {
+			w *= 0.15
+		}
+
+		// Near-win bonus: als je na deze zet ≤3 kaarten overhoudt, verhoog het gewicht
+		// sterk. Dit overstijgt rank-voorkeur en dump-bonussen in de eindspelfase.
+		// Bijv. QQQ (cardsAfter=1) wint terecht van 5 (cardsAfter=3) bij {5,Q,Q,Q}.
+		switch cardsAfterM {
+		case 1:
+			w *= 6.0
+		case 2:
+			w *= 3.0
+		case 3:
+			w *= 1.5
 		}
 
 		weights[i] = w
