@@ -9,7 +9,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -1243,83 +1242,6 @@ func (kt *KnowledgeTracker) TotalOpponentCards() int {
 	return total
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ENGINE - WEIGHTS
-// ═══════════════════════════════════════════════════════════════
-
-type Weights struct {
-	AceBonus           float64 `json:"ace_bonus"`
-	WildBonus          float64 `json:"wild_bonus"`
-	SynergyBonus       float64 `json:"synergy_bonus"`
-	CardDiffWeight     float64 `json:"card_diff_weight"`
-	KingPenalty        float64 `json:"king_penalty"`
-	QueenPenalty       float64 `json:"queen_penalty"`
-	IsolatedLowPenalty float64 `json:"isolated_low_penalty"`
-	ClusterBonus       float64 `json:"cluster_bonus"`
-	TempoBonus         float64 `json:"tempo_bonus"`
-	AcePlayFactor      float64 `json:"ace_play_factor"`
-	WildPlayFactor     float64 `json:"wild_play_factor"`
-	SynergyPenalty     float64 `json:"synergy_penalty"`
-	RankPreference     float64 `json:"rank_preference"`
-	PassBase           float64 `json:"pass_base"`
-	PassSpecialFactor  float64 `json:"pass_special_factor"`
-	PassBehindFactor   float64 `json:"pass_behind_factor"`
-	UrgencyPenalty     float64 `json:"urgency_penalty"`
-	EarlyGamePassFactor float64 `json:"early_game_pass_factor"`
-}
-
-func DefaultWeights() Weights {
-	return Weights{
-		AceBonus:            0.33,
-		WildBonus:           0.38,   // verhoogd: 0.21→0.38 (wildcard bewaren loont meer)
-		SynergyBonus:        0.20,   // verhoogd: 0.12→0.20 (ace+wild synergie beter gewaardeerd)
-		CardDiffWeight:      0.085,
-		KingPenalty:         0.05,
-		QueenPenalty:        0.032,
-		IsolatedLowPenalty:  0.042,
-		ClusterBonus:        0.038,
-		TempoBonus:          0.085,
-		AcePlayFactor:       0.52,
-		WildPlayFactor:      0.33,   // verlaagd: 0.41→0.33 (simulaties spelen wilds spaarzamer)
-		SynergyPenalty:      0.40,
-		RankPreference:      0.11,
-		PassBase:            0.085,
-		PassSpecialFactor:   0.225,
-		PassBehindFactor:    0.31,
-		UrgencyPenalty:      0.09,
-		EarlyGamePassFactor: 0.32,    // nieuwe parameter: bonus voor early-game pass bij gelijke handen
-	}
-}
-
-func clamp(v, lo, hi float64) float64 {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
-}
-
-func LoadWeights(path string) (Weights, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return DefaultWeights(), err
-	}
-	w := DefaultWeights()
-	if err := json.Unmarshal(data, &w); err != nil {
-		return DefaultWeights(), err
-	}
-	return w, nil
-}
-
-func SaveWeights(w Weights, path string) error {
-	data, err := json.MarshalIndent(w, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
 
 // ═══════════════════════════════════════════════════════════════
 // ENGINE - HEURISTICS
@@ -1534,19 +1456,16 @@ type Config struct {
 	MaxTime        time.Duration
 	ExploreConst   float64
 	NumPlayers     int
-	Weights        Weights
 	OmniscientMode bool
 	NumWorkers     int
 }
 
 func DefaultConfig(numPlayers int) Config {
-	w, _ := LoadWeights("storage/shared/Documents/weights.json")
 	return Config{
 		Iterations:   10000,
 		MaxTime:      0,
 		ExploreConst: 1.4,
 		NumPlayers:   numPlayers,
-		Weights:      w,
 		NumWorkers:   2,
 	}
 }
@@ -2290,7 +2209,6 @@ func positionScore(gs *GameState, myID int) float64 {
 }
 
 func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
-	wts := e.Config.Weights
 	handCount := gs.Hands[gs.CurrentTurn].Count()
 
 	// Directe win move altijd spelen
@@ -2322,7 +2240,7 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	}
 
 	// PASS CHANCE
-	passChance := wts.PassBase + specialRatio*wts.PassSpecialFactor
+	passChance := 0.085 + specialRatio*0.225
 
 	// Early-game pass bonus: alleen bij 3+ spelers.
 	// In 2-speler is passen altijd gevaarlijk (tegenstander krijgt open ronde), dus nooit verhogen.
@@ -2330,7 +2248,7 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		for i, h := range gs.Hands {
 			if i != gs.CurrentTurn && !gs.Finished[i] {
 				if handCount <= h.Count() {
-					passChance += wts.EarlyGamePassFactor
+					passChance += 0.32
 				}
 				break
 			}
@@ -2394,9 +2312,9 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 	}
 
 	// === SPEEL-KEUZE ===
-	acePlayFactor := wts.AcePlayFactor
-	wildPlayFactor := wts.WildPlayFactor
-	synergyPenalty := wts.SynergyPenalty
+	acePlayFactor := 0.52
+	wildPlayFactor := 0.33
+	synergyPenalty := 0.40
 
 	weights := make([]float64, len(plays))
 	total := 0.0
@@ -2490,7 +2408,7 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			// !IsSpecial() includes Ace now (natural card), but Ace has high rank
 			// The formula rewards LOW ranks; Ace (14) gets slight penalty = correct
 			if !c.IsSpecial() {
-				w *= 1.0 + wts.RankPreference*(13.0-float64(c.Rank))
+				w *= 1.0 + 0.11*(13.0-float64(c.Rank))
 			}
 		}
 
@@ -2522,6 +2440,49 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			w *= 1.5
 		}
 
+		// ── FIX 2: "Lage first, hoge last" bij 2 kaarten in open ronde ──────
+		// Als je 2 kaarten hebt, beide singles, open ronde:
+		// speel de LAGE eerst zodat de HOGE als sluitsteen overblijft.
+		// Voorbeeld: hand={5, K}, open ronde → speel 5, bewaar K als finale.
+		// Omgekeerd (K spelen, 5 over) = rampzalig: 5 kan niet antwoorden op doubles.
+		//
+		// Uitzondering: als de twee kaarten een paar zijn, maakt volgorde niet uit —
+		// maar paren worden toch al als één zet gespeeld (cardsAfterM=0 → winst).
+		if handCount == 2 && gs.Round.IsOpen && len(m.Cards) == 1 &&
+			wilds == 0 && resets == 0 {
+			// Bepaal welke kaart overblijft na deze zet
+			var remainingRank Rank
+			for _, c := range curHand.Cards {
+				if c.Rank != effective {
+					remainingRank = c.Rank
+					break
+				}
+			}
+			if remainingRank > 0 && remainingRank != effective {
+				// We spelen `effective`, bewaren `remainingRank`
+				// Bonus als de overblijvende kaart HOGER is (goede sluitsteen)
+				// Penalty als de overblijvende kaart LAGER is (slechte sluitsteen)
+				if remainingRank > effective {
+					// Lage kaart spelen, hoge bewaren → correct
+					w *= 4.0
+				} else {
+					// Hoge kaart spelen, lage bewaren → riskant
+					// Hoe lager de overblijvende kaart, hoe groter de straf
+					switch {
+					case remainingRank <= RankFive:
+						w *= 0.05 // catastrofaal: 3/4/5 als sluitsteen
+					case remainingRank <= RankEight:
+						w *= 0.15 // slecht
+					case remainingRank <= RankTen:
+						w *= 0.35 // riskant
+					case remainingRank <= RankQueen:
+						w *= 0.60 // matig
+					}
+				}
+			}
+		}
+		// ────────────────────────────────────────────────────────────────────
+
 		weights[i] = w
 		total += w
 	}
@@ -2545,7 +2506,6 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 	if myCount == 0 {
 		return 1.0
 	}
-	wts := e.Config.Weights
 	minOpp := 999
 	for i, h := range gs.Hands {
 		if i != myID && !gs.Finished[i] && h.Count() < minOpp {
@@ -2555,46 +2515,46 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 	if minOpp == 999 {
 		minOpp = 0
 	}
-	score := 0.5 + float64(minOpp-myCount)*wts.CardDiffWeight
+	score := 0.5 + float64(minOpp-myCount)*0.085
 
 	// Urgentiepenalty: bij 3+ kaarten achter een extra niet-lineaire straf.
 	gap := myCount - minOpp
 	if gap >= 3 {
-		score -= math.Pow(float64(gap), 1.2) * wts.UrgencyPenalty  // exponent voor sterker effect bij grote gap		
+		score -= math.Pow(float64(gap), 1.2) * 0.09
 	}
 
 	hand := gs.Hands[myID]
 	wilds := hand.CountRank(RankTwo)    // alleen 2 is wildcard
 	resets := hand.CountRank(RankJoker) // joker is reset-kaart
-	score += float64(resets) * wts.AceBonus  // joker is nu de reset = voormalige aas-bonus
-	score += float64(wilds) * wts.WildBonus
+	score += float64(resets) * 0.33
+	score += float64(wilds) * 0.38
 	if resets > 0 && wilds > 0 {
-		score += float64(imin(resets, wilds)) * wts.SynergyBonus
+		score += float64(imin(resets, wilds)) * 0.20
 	}
 	kings := hand.CountRank(RankKing)
 	if kings > 0 && wilds == 0 && resets == 0 {
-		score -= float64(kings) * wts.KingPenalty
+		score -= float64(kings) * 0.05
 	}
 	queens := hand.CountRank(RankQueen)
 	if queens > 0 && wilds == 0 && resets == 0 {
-		score -= float64(queens) * wts.QueenPenalty
+		score -= float64(queens) * 0.032
 	}
 	// Geïsoleerde lage kaarten (3-7): moeilijk te dumpen als single
 	for r := RankThree; r <= RankSeven; r++ {
 		if hand.CountRank(r) == 1 && wilds == 0 {
-			score -= wts.IsolatedLowPenalty
+			score -= 0.042
 		}
 	}
 	// Geïsoleerde midden-kaarten (8-X): ook lastig, maar iets minder erg
 	for r := RankEight; r <= RankTen; r++ {
 		if hand.CountRank(r) == 1 && wilds == 0 {
-			score -= wts.IsolatedLowPenalty * 0.5
+			score -= 0.042 * 0.5
 		}
 	}
 	for r := RankThree; r <= RankAce; r++ {
 		cnt := hand.CountRank(r)
 		if cnt >= 2 {
-			score += float64(cnt-1) * wts.ClusterBonus
+			score += float64(cnt-1) * 0.038
 			// Hoge paren zijn meer waard: een paar Aces is veel sterker dan paar 3-en.
 			// Bonus gebaseerd op rank (3=0.0, Ace=1.0) × 0.04 per extra kaart.
 			rankFactor := float64(r-RankThree) / float64(RankAce-RankThree)
@@ -2613,13 +2573,129 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 			}
 		}
 	}
-	// Tempo: open ronde op je beurt is een voordeel, maar proportioneel —
+
+	// ── FIX 1: Eindkaart-kwaliteit ──────────────────────────────────────────
+	// Met 1 kaart over is de kwaliteit van die kaart allesbepalend:
+	//   - Lage single (3-7):  bijna zeker verlies — tegenstander heeft altijd
+	//     iets hoger, en in open ronde ben je verplicht die lage kaart te openen.
+	//   - Midden single (8-Q): neutraal tot licht negatief.
+	//   - Hoge single (K, 1): sterk — verslaat bijna alles als single.
+	//   - Wildcard (2) of Joker (0): uitstekend — altijd speelbaar.
+	if myCount == 1 {
+		c := hand.Cards[0]
+		switch {
+		case c.IsReset() || c.IsWild():
+			score += 0.18 // joker of 2: altijd uitweg
+		case c.Rank == RankAce:
+			score += 0.12 // aas single: sterk slotkaart
+		case c.Rank == RankKing:
+			score += 0.06 // heer: goed maar niet onfeilbaar
+		case c.Rank >= RankTen:
+			score -= 0.04 // X/J/Q als single: riskant
+		case c.Rank >= RankEight:
+			score -= 0.12 // 8/9: slecht als laatste kaart
+		default:
+			score -= 0.22 // 3-7 als laatste kaart: bijna verloren
+		}
+	}
+
+	// Met 2 kaarten over: de laagste kaart bepaalt het risico.
+	// Paar = altijd in 1 zet kwijt → sterk.
+	// Twee verschillende singles → de lage is een blok: penalty naar gelang rank.
+	if myCount == 2 && wilds == 0 && resets == 0 {
+		ranks := []Rank{}
+		for _, c := range hand.Cards {
+			if !c.IsSpecial() {
+				ranks = append(ranks, c.Rank)
+			}
+		}
+		if len(ranks) == 2 {
+			if ranks[0] == ranks[1] {
+				// Paar: altijd in 1 zet kwijt — sterk eindspel
+				score += 0.10
+			} else {
+				// Twee verschillende singles: laagste kaart is het risico
+				low := ranks[0]
+				if ranks[1] < low {
+					low = ranks[1]
+				}
+				// Hoe lager de laagste kaart, hoe groter het verliesrisico
+				// (tegenstander kan doubles spelen waartegen je niet kunt)
+				switch {
+				case low <= RankFive:
+					score -= 0.16
+				case low <= RankEight:
+					score -= 0.09
+				case low <= RankTen:
+					score -= 0.04
+				}
+			}
+		}
+	}
+	// ────────────────────────────────────────────────────────────────────────
+	// ── FIX 3: Sluitpatroon bij 3 kaarten ──────────────────────────────────
+	// Bij 3 kaarten zijn er goede en slechte patronen:
+	//   GOED:  paar + 1 hogere single  → dump single, dan paar als afsluiter
+	//          paar + wildcard/joker   → bijna zekere win
+	//          triple                  → 1 zet klaar
+	//   SLECHT: 3 verschillende singles waarvan ≥1 laag → moeilijk te manoeuvreren
+	//           de tegenstander kan doubles spelen waartegen je geen antwoord hebt
+	if myCount == 3 && wilds == 0 && resets == 0 {
+		rankCounts3 := map[Rank]int{}
+		for _, c := range hand.Cards {
+			if !c.IsSpecial() {
+				rankCounts3[c.Rank]++
+			}
+		}
+		hasPair3 := false
+		hasTriple3 := false
+		var pairRank3 Rank
+		var singles3 []Rank
+		for r, cnt := range rankCounts3 {
+			if cnt >= 3 {
+				hasTriple3 = true
+			} else if cnt == 2 {
+				hasPair3 = true
+				pairRank3 = r
+			} else {
+				singles3 = append(singles3, r)
+			}
+		}
+		switch {
+		case hasTriple3:
+			score += 0.12 // triple: altijd in 1 zet klaar
+		case hasPair3 && len(singles3) == 1:
+			single3 := singles3[0]
+			if single3 < pairRank3 {
+				// Single lager dan paar: dump single, sluit met paar → goed patroon
+				score += 0.08
+			} else {
+				// Single hoger dan paar: onhandig — paar is moeilijk te dumpen
+				score += 0.02
+			}
+		default:
+			// 3 verschillende singles: kwetsbaar voor doubles
+			var minRank3 Rank = RankAce + 1
+			for r := range rankCounts3 {
+				if r < minRank3 {
+					minRank3 = r
+				}
+			}
+			switch {
+			case minRank3 <= RankFive:
+				score -= 0.10
+			case minRank3 <= RankEight:
+				score -= 0.05
+			}
+		}
+	}
+	// ────────────────────────────────────────────────────────────────────────
 	// niet zo groot dat het kaartdifferentieel overschaduwt.
 	// Oude waarde (4.0x = 0.34 + 0.45 voor Joker = 0.79!) was absurd groot
 	// en maakte dat PASS kunstmatig goed scoorde in MCTS rollouts,
 	// omdat rolloutevaluaties met open-ronde-posities altijd ~1.0 teruggaven.
 	if gs.Round.IsOpen && gs.CurrentTurn == myID {
-		score += wts.TempoBonus * 1.2 // 0.085*1.2 = ~0.10 (was 0.34)
+		score += 0.085 * 1.2
 		if hand.CountResets() > 0 {
 			score += 0.08 // was 0.45 — joker+tempo is sterk maar niet allesbepalend
 		}
@@ -3045,7 +3121,6 @@ func main() {
 		fmt.Println("  [2] Analyse - Bekijk een gespeeld spel opnieuw")
 		fmt.Println("  [3] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
 		fmt.Println("  [4] Snelle analyse - Plak een volledige partij in één keer")
-		fmt.Println("  [5] Weight Tuner - Optimaliseer de AI gewichten (krachtige PC)")
 		fmt.Println()
 		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4): ")
 		mode, _ := strconv.Atoi(modeStr)
@@ -3063,9 +3138,6 @@ func main() {
 			return
 		case 4:
 			quickAnalyzeMode(reader, cfg)
-			return
-		case 5:
-			weightTunerMode(reader, cfg)
 			return
 		default:
 			playMode(reader, cfg)
@@ -4022,132 +4094,6 @@ func printRanking(gs *GameState) {
 	}
 }
 
-// ═══════════════════════════════════════════════════════════════
-// WEIGHT TUNER v2.1 — met Elitism + Adaptive Mutation (krachtige PC)
-// ═══════════════════════════════════════════════════════════════
-
-func weightTunerMode(reader *Reader, cfg settings) {
-	PrintHeader("Weight Tuner v2.1 — Elitism Edition")
-	fmt.Println("Zeer sterke optimalisatie met elitism en adaptieve mutatie.")
-	fmt.Println()
-
-	games, _ := reader.ReadInt("Games per matchup (aanbevolen 600-1200): ")
-	if games < 100 { games = 800 }
-	generations, _ := reader.ReadInt("Aantal generaties (aanbevolen 25-60): ")
-	if generations < 10 { generations = 35 }
-	iters, _ := reader.ReadInt("Iteraties per zet (aanbevolen 8000-15000): ")
-	if iters < 2000 { iters = 10000 }
-
-	fmt.Printf("\n🚀 Start TUNER v2.1\n")
-	fmt.Printf("Games: %d | Generaties: %d | Iters: %d | Threads: %d\n\n", 
-		games, generations, iters, cfg.numThreads)
-
-	current, _ := LoadWeights("weights.json")
-	best := current
-	bestScore := 0.0
-
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	for gen := 1; gen <= generations; gen++ {
-		fmt.Printf("Generatie %2d/%d  ─  Beste score tot nu: %.2f%%\n", gen, generations, bestScore*100)
-
-		// Elitism: beste altijd behouden
-		candidates := []Weights{best}
-
-		// 15 mutants
-		for m := 0; m < 15; m++ {
-			mutStrength := 0.22
-			if float64(gen) > float64(generations)*0.6 {
-				mutStrength = 0.09 // later fijner tunen
-			}
-			mutant := perturbWeights(best, rng, mutStrength)
-			score := evaluateWeights(mutant, games, iters, cfg.numThreads, rng)
-
-			candidates = append(candidates, mutant)
-
-			if score > bestScore {
-				best = mutant
-				bestScore = score
-				fmt.Printf("   🔥 NIEUWE BESTE! %.2f%% (mutant %d)\n", score*100, m+1)
-			}
-		}
-
-		// Random restart elke 6 generaties
-		if gen%6 == 0 && gen < generations {
-			fmt.Println("   🔄 Random restart (ontsnapt aan lokaal maximum)")
-			best = perturbWeights(best, rng, 0.45)
-		}
-	}
-
-	SaveWeights(best, "weights.json")
-	fmt.Printf("\n🏆 TUNING AFGEROND!\n")
-	fmt.Printf("Beste score: %.2f%%\n", bestScore*100)
-	fmt.Println("Gewichten opgeslagen in weights.json")
-	fmt.Println("Je kunt nu direct met de verbeterde AI spelen.")
-}
-
-func perturbWeights(base Weights, rng *rand.Rand, strength float64) Weights {
-	w := base
-	w.AceBonus           = clamp(w.AceBonus          *(1 + strength*(rng.Float64()*2-1)), 0.08, 0.85)
-	w.WildBonus          = clamp(w.WildBonus         *(1 + strength*(rng.Float64()*2-1)), 0.08, 0.65)
-	w.SynergyBonus       = clamp(w.SynergyBonus      *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.45)
-	w.CardDiffWeight     = clamp(w.CardDiffWeight    *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.30)
-	w.KingPenalty        = clamp(w.KingPenalty       *(1 + strength*(rng.Float64()*2-1)), 0.01, 0.18)
-	w.QueenPenalty       = clamp(w.QueenPenalty      *(1 + strength*(rng.Float64()*2-1)), 0.01, 0.15)
-	w.IsolatedLowPenalty = clamp(w.IsolatedLowPenalty*(1 + strength*(rng.Float64()*2-1)), 0.01, 0.18)
-	w.ClusterBonus       = clamp(w.ClusterBonus      *(1 + strength*(rng.Float64()*2-1)), 0.01, 0.20)
-	w.TempoBonus         = clamp(w.TempoBonus        *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.30)
-	w.AcePlayFactor      = clamp(w.AcePlayFactor     *(1 + strength*(rng.Float64()*2-1)), 0.15, 1.3)
-	w.WildPlayFactor     = clamp(w.WildPlayFactor    *(1 + strength*(rng.Float64()*2-1)), 0.15, 1.1)
-	w.SynergyPenalty     = clamp(w.SynergyPenalty    *(1 + strength*(rng.Float64()*2-1)), 0.15, 1.1)
-	w.RankPreference     = clamp(w.RankPreference    *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.45)
-	w.PassBase           = clamp(w.PassBase          *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.35)
-	w.PassSpecialFactor  = clamp(w.PassSpecialFactor *(1 + strength*(rng.Float64()*2-1)), 0.05, 0.65)
-	w.PassBehindFactor   = clamp(w.PassBehindFactor  *(1 + strength*(rng.Float64()*2-1)), 0.10, 0.85)
-	w.UrgencyPenalty     = clamp(w.UrgencyPenalty    *(1 + strength*(rng.Float64()*2-1)), 0.02, 0.25)
-	return w
-}
-
-func evaluateWeights(w Weights, games int, iters int, threads int, rng *rand.Rand) float64 {
-	config := DefaultConfig(2)
-	config.Iterations = iters
-	config.NumWorkers = threads
-	config.Weights = w
-	config.OmniscientMode = true
-
-	wins := 0
-	for g := 0; g < games; g++ {
-		gs := NewGame(2, rng, rng.Intn(2)) // random startspeler
-		t1 := NewKnowledgeTracker(2, 0, gs.Hands[0], gs.DeadCards)
-		t2 := NewKnowledgeTracker(2, 1, gs.Hands[1], gs.DeadCards)
-		e1 := NewEngine(config)
-		e2 := NewEngine(config)
-
-		for !gs.GameOver {
-			pid := gs.CurrentTurn
-			var eng *Engine
-			var tr *KnowledgeTracker
-			if pid == 0 {
-				eng, tr = e1, t1
-			} else {
-				eng, tr = e2, t2
-			}
-			move, _ := eng.BestMove(gs, tr)
-			gs.ApplyMove(move)
-			t1.RecordMove(move)
-			t2.RecordMove(move)
-		}
-
-		if gs.Ranking[0] == 1 { // speler 2 wint
-			wins++
-		}
-	}
-	return float64(wins) / float64(games)
-}
-
-// Onderdruk "declared but not used" voor hulpfuncties die enkel door de tuner gebruikt worden
-var _ = clamp
-var _ = SaveWeights
 var _ = SaveGame
 var _ = LoadGame
 var _ = EvaluateHand
