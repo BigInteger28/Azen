@@ -67,7 +67,7 @@ Als alle andere spelers passen, begint de speler die het laatste speelde een nie
 - Mag altijd gespeeld worden, ongeacht rank of aantal op tafel
 - Reset de ronde: de speler die de joker speelt, opent direct een nieuwe ronde
 - **Mag gecombineerd worden met elke kaart** — normale kaarten, wildcards, of alleen
-- Als de joker gecombineerd wordt met normale kaarten, moeten die normale kaarten wel dezelfde rank hebben
+- Als de joker gecombineerd wordt met normale kaarten als antwoord, moeten die normale kaarten hoger zijn dan de rank op tafel — de `2` (wildcard) is de uitzondering en kan altijd gespeeld worden ongeacht de tafelpositie
 - Er zijn **2 jokers** per deck (4 bij vierspelersvariant met 2 decks)
 
 ### Combinaties
