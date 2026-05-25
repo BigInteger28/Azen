@@ -545,29 +545,19 @@ func (gs *GameState) ValidateMove(m Move) error {
 }
 
 func (gs *GameState) validateOpenPlay(m Move) error {
-	hasReset, hasNormal, normalRank, err := classifyCards(m.Cards)
-	if err != nil {
-		return err
-	}
-	if hasReset && hasNormal {
-		return fmt.Errorf("een joker (0) mag enkel samen met een 2 of andere joker gespeeld worden, niet met normale kaarten")
-	}
-	_ = normalRank
-	return nil
+	_, _, _, err := classifyCards(m.Cards)
+	return err
 }
 
 func (gs *GameState) validateResponsePlay(m Move) error {
-	hasReset, hasNormal, normalRank, err := classifyCards(m.Cards)
+	hasReset, _, normalRank, err := classifyCards(m.Cards)
 	if err != nil {
 		return err
-	}
-	if hasReset && hasNormal {
-		return fmt.Errorf("een joker (0) mag enkel samen met een 2 of andere joker gespeeld worden, niet met normale kaarten")
 	}
 	if len(m.Cards) != gs.Round.Count {
 		return fmt.Errorf("moet exact %d kaart(en) spelen (gespeeld: %d)", gs.Round.Count, len(m.Cards))
 	}
-	if normalRank != 0 && normalRank <= gs.Round.TableRank {
+	if !hasReset && normalRank != 0 && normalRank <= gs.Round.TableRank {
 		return fmt.Errorf("rank %d verslaat tafel-rank %d niet", normalRank, gs.Round.TableRank)
 	}
 	return nil
@@ -688,7 +678,7 @@ func genOpenMoves(pid int, hand *Hand) []Move {
 		if len(normals) == 0 {
 			continue
 		}
-		maxTotal := imin(len(normals)+len(wilds), 6)
+		maxTotal := len(normals) + len(wilds)
 		for total := 1; total <= maxTotal; total++ {
 			for numNorm := imax(1, total-len(wilds)); numNorm <= imin(len(normals), total); numNorm++ {
 				numWild := total - numNorm
@@ -713,13 +703,40 @@ func genOpenMoves(pid int, hand *Hand) []Move {
 		}
 	}
 
-	for total := 1; total <= imin(len(wilds), 6); total++ {
+	for total := 1; total <= len(wilds); total++ {
 		for _, wc := range combos(wilds, total) {
 			moves = append(moves, Move{PlayerID: pid, Cards: wc})
 		}
 	}
 
 	moves = append(moves, genResetMoves(pid, resets, wilds)...)
+
+	// Joker + normale kaarten (± wildcards) van dezelfde rank (bv. "70", "044", "444422200")
+	for _, rank := range NormalRanks() {
+		normals := byRank[rank]
+		if len(normals) == 0 {
+			continue
+		}
+		for numReset := 1; numReset <= len(resets); numReset++ {
+			for numNorm := 1; numNorm <= len(normals); numNorm++ {
+				for _, rc := range combos(resets, numReset) {
+					for _, nc := range combos(normals, numNorm) {
+						// Zonder wilds
+						merged := append(append([]Card{}, rc...), nc...)
+						moves = append(moves, Move{PlayerID: pid, Cards: merged})
+						// Met wildcards erbij
+						for numWild := 1; numWild <= len(wilds); numWild++ {
+							for _, wc := range combos(wilds, numWild) {
+								full := append(append(append([]Card{}, rc...), nc...), wc...)
+								moves = append(moves, Move{PlayerID: pid, Cards: full})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return dedup(moves)
 }
 
@@ -767,13 +784,43 @@ func genResponseMoves(pid int, hand *Hand, round RoundState) []Move {
 	}
 
 	moves = append(moves, genResetResponseMoves(pid, resets, wilds, need)...)
+
+	// Joker + normale kaarten (± wildcards) als antwoord
+	for _, rank := range NormalRanks() {
+		normals := hand.GetByRank(rank)
+		if len(normals) == 0 {
+			continue
+		}
+		for numReset := 1; numReset <= imin(len(resets), need); numReset++ {
+			for numNorm := 1; numNorm <= imin(len(normals), need-numReset); numNorm++ {
+				numWild := need - numReset - numNorm
+				if numWild < 0 || numWild > len(wilds) {
+					continue
+				}
+				for _, rc := range combos(resets, numReset) {
+					for _, nc := range combos(normals, numNorm) {
+						if numWild == 0 {
+							merged := append(append([]Card{}, rc...), nc...)
+							moves = append(moves, Move{PlayerID: pid, Cards: merged})
+						} else {
+							for _, wc := range combos(wilds, numWild) {
+								merged := append(append(append([]Card{}, rc...), nc...), wc...)
+								moves = append(moves, Move{PlayerID: pid, Cards: merged})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return dedup(moves)
 }
 
 func genResetMoves(pid int, resets, wilds []Card) []Move {
 	var moves []Move
 	for numReset := 1; numReset <= len(resets); numReset++ {
-		maxW := imin(len(wilds), 6-numReset)
+		maxW := len(wilds)
 		rCombos := combos(resets, numReset)
 		for numWild := 0; numWild <= maxW; numWild++ {
 			if numWild == 0 {
