@@ -550,14 +550,16 @@ func (gs *GameState) validateOpenPlay(m Move) error {
 }
 
 func (gs *GameState) validateResponsePlay(m Move) error {
-	hasReset, _, normalRank, err := classifyCards(m.Cards)
+	_, hasNormal, normalRank, err := classifyCards(m.Cards)
 	if err != nil {
 		return err
 	}
 	if len(m.Cards) != gs.Round.Count {
 		return fmt.Errorf("moet exact %d kaart(en) spelen (gespeeld: %d)", gs.Round.Count, len(m.Cards))
 	}
-	if !hasReset && normalRank != 0 && normalRank <= gs.Round.TableRank {
+	// Rank-check geldt altijd als er normale kaarten aanwezig zijn — ook met joker.
+	// Puur joker+wildcards hoeft de rank niet te verslaan (joker reset altijd).
+	if hasNormal && normalRank != 0 && normalRank <= gs.Round.TableRank {
 		return fmt.Errorf("rank %d verslaat tafel-rank %d niet", normalRank, gs.Round.TableRank)
 	}
 	return nil
@@ -785,8 +787,11 @@ func genResponseMoves(pid int, hand *Hand, round RoundState) []Move {
 
 	moves = append(moves, genResetResponseMoves(pid, resets, wilds, need)...)
 
-	// Joker + normale kaarten (± wildcards) als antwoord
+	// Joker + normale kaarten (± wildcards) als antwoord — normale rank moet tafel verslaan
 	for _, rank := range NormalRanks() {
+		if rank <= tableRank {
+			continue
+		}
 		normals := hand.GetByRank(rank)
 		if len(normals) == 0 {
 			continue
@@ -1727,8 +1732,11 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 	}
 	tableRank := round.TableRank
 
-	// Bepaal de hoogste effectieve rank die bereikbaar is via naturelle zetten (geen wilds, geen aces)
+	// Bepaal de hoogste effectieve rank bereikbaar via:
+	// 1. maxNaturalRank  = alleen normale kaarten (geen wild, geen reset)
+	// 2. maxNonResetRank = normale kaarten + wildcards (geen reset/joker)
 	maxNaturalRank := Rank(0)
+	maxNonResetRank := Rank(0)
 	for _, m := range moves {
 		if m.IsPass {
 			continue
@@ -1743,14 +1751,18 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 				hasNormal = true
 			}
 		}
-		if !hasWild && !hasReset && hasNormal {
-			if er := m.EffectiveRank(tableRank); er > maxNaturalRank {
+		if hasReset {
+			continue // reset-zetten niet meerekenen in maxNonResetRank
+		}
+		er := m.EffectiveRank(tableRank)
+		if !hasWild && hasNormal {
+			if er > maxNaturalRank {
 				maxNaturalRank = er
 			}
 		}
-	}
-	if maxNaturalRank == 0 {
-		return moves // Geen naturelle zetten beschikbaar — alles bewaren
+		if er > maxNonResetRank {
+			maxNonResetRank = er
+		}
 	}
 
 	filtered := make([]Move, 0, len(moves))
@@ -1770,49 +1782,43 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 			}
 		}
 		// Oversized combo filter ("/" zetten met meer kaarten dan de tabelgrootte).
-		// Voorbeeld: tafel = XX (2 kaarten), naturelle KK beschikbaar, maar engine speelt
-		// "01/55" (4 kaarten: joker+aas+5+5). De joker+aas is verspilling als KK volstaat.
-		// Regel: filter oversized special combos als een naturelle zet de tafel al verslaat.
-		// Uitzondering: als geen naturelle zet bestaat (maxNaturalRank == 0 of ≤ tableRank),
-		// dan is de oversized combo soms de enige optie → bewaren.
-		if len(m.Cards) > round.Count && (hasWild || hasReset) && maxNaturalRank > tableRank {
-			continue // gefilterd: naturelle zet is efficiënter dan deze "/" combo
+		if len(m.Cards) > round.Count && (hasWild || hasReset) && maxNonResetRank > tableRank {
+			continue // gefilterd: goedkopere zet is efficiënter dan deze "/" combo
 		}
-		if !hasWild {
-			filtered = append(filtered, m) // Naturelle zet (geen wildcards): altijd bewaren
+
+		// Pure natural (geen wild, geen reset): altijd bewaren.
+		if !hasWild && !hasReset {
+			filtered = append(filtered, m)
 			continue
 		}
-		// Vanaf hier: zet bevat minstens één wildcard.
+		// Vanaf hier: minstens één speciale kaart (wild of reset/joker).
 
-		// Puur-wild (geen reset, geen normaal — bijv. 2+2):
-		// een naturelle zet verslaat de tafel en spaart alle wildcards → filter.
-		if !hasNormal && !hasReset {
-			continue // gefilterd: puur-wild gedomineerd door naturelle zetten
+		// Hiërarchie van "kostprijs": natural < wild-only < wild+reset of reset+normal.
+		// Gebruik altijd de goedkoopste effectieve optie.
+
+		// Als naturelle zetten de tafel al verslaan:
+		// bewaar ALLEEN pure joker-resets (geven tempo zonder wildcards te kosten).
+		// Alles met wildcards of normale kaarten naast de joker is verspilling.
+		if maxNaturalRank > tableRank {
+			if hasReset && !hasNormal && !hasWild {
+				filtered = append(filtered, m) // pure joker: tempo-zet
+			}
+			continue
 		}
-		// Wild+joker (bijv. "2 0") EN wild+normaal (bijv. "K 2", "A 2"):
-		// beide gebruiken een wildcard. Alleen bewaren als de effectieve rank
-		// voldoende hoger is dan alle naturelle opties.
-		// Bij hoge naturelle ranks (≥10) is een 1-rank voordeel te klein:
-		// de wildcard-kost weegt niet op tegen het minimale voordeel.
-		// Eis 2+ rank voordeel zodra maxNaturalRank ≥ RankTen.
-		//
-		// Voorbeeld wild+aas "0 1" (rank 14) vs KK (rank 13, ≥10):
-		//   threshold=14, 14>14=false → gefilterd ✓ (KK volstaat!)
-		// Voorbeeld wild+aas "0 1" (rank 14) vs JJ (rank 11, ≥10):
-		//   threshold=12, 14>12=true  → bewaard  ✓ (3-rank voordeel)
-		// Voorbeeld wild+normaal "K 2" (rank 13) vs QQ (rank 12, ≥10):
-		//   threshold=13, 13>13=false → gefilterd ✓
-		// Voorbeeld wild+normaal "K 2" (rank 13) vs JJ (rank 11, ≥10):
-		//   threshold=12, 13>12=true  → bewaard  ✓
-		er := m.EffectiveRank(tableRank)
-		threshold := maxNaturalRank
-		if maxNaturalRank >= RankTen {
-			threshold++ // vereist 2+ rank voordeel bij hoge naturelle ranks
+		// Naturelle zetten kunnen de tafel niet verslaan.
+		// Als niet-reset zetten (wild+normaal) de tafel verslaan: filter reset-zetten.
+		// "8822" domineert "8820" — zelfde rang, minder kostbaar.
+		if maxNonResetRank > tableRank {
+			if !hasReset {
+				filtered = append(filtered, m) // wild-only zet: bewaren
+			}
+			// reset-zet gedomineerd door wild-only zet: filter
+			continue
 		}
-		if er > threshold {
+		// Geen non-reset zet verslaat de tafel: bewaar alles dat de tafel verslaat.
+		if hasReset || m.EffectiveRank(tableRank) > tableRank {
 			filtered = append(filtered, m)
 		}
-		// Gefilterd: wildcard-voordeel te klein t.o.v. beschikbare naturelle zetten
 	}
 	return filtered
 }
@@ -1960,12 +1966,18 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		}
 		// Override PASS als situatie gevaarlijk is of tafel zo laag is dat passen bijna nooit zinvol is
 		lowTable := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
-		urgent := myCards-oppCards >= 4 || (activePlayerCount(gs) <= 2 && oppCards <= 5) || lowTable
+		twoPlayer := activePlayerCount(gs) <= 2
+		urgent := myCards-oppCards >= 4 || (twoPlayer && oppCards <= 5) || lowTable || twoPlayer
 		threshold := 0.03
-		if lowTable {
-			threshold = 0.12 // op lage tafel ook override als non-pass tot 12% slechter is
+		if twoPlayer {
+			threshold = 0.08 // 2-speler: override pass als spelen max 8% minder scoort
 		}
-		if bestNonPassKey != "" && urgent && (bestNonPassWR >= passWR-threshold) {
+		if lowTable && threshold < 0.07 {
+			threshold = 0.07
+		}
+		// Minimumdrempel: override nooit naar een vrijwel kansloze zet (< 2% winstkans).
+		// Bijv. "022" op triple aas geeft 0.4% — veel slechter dan passen (joker bewaren).
+		if bestNonPassKey != "" && urgent && bestNonPassWR >= 0.02 && (bestNonPassWR >= passWR-threshold) {
 			bestKey = bestNonPassKey
 			bestVisits = totalVisits[bestKey]
 			bestMove = moveMap[bestKey]
@@ -2016,16 +2028,20 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 	myCards2 := gs.Hands[myID].Count()
 	oppCards2 := minOppHandCount(gs, myID)
 	lowTable2 := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
-	urgent2 := myCards2-oppCards2 >= 4 || (activePlayerCount(gs) <= 2 && oppCards2 <= 5) || lowTable2
+	twoPlayer2 := activePlayerCount(gs) <= 2
+	urgent2 := myCards2-oppCards2 >= 4 || (twoPlayer2 && oppCards2 <= 5) || lowTable2 || twoPlayer2
 	if bestMove.IsPass && urgent2 {
 		passWR := eval.Score
 		threshold2 := 0.03
-		if lowTable2 {
-			threshold2 = 0.12
+		if twoPlayer2 {
+			threshold2 = 0.08
+		}
+		if lowTable2 && threshold2 < 0.07 {
+			threshold2 = 0.07
 		}
 		if m, ok := bestNonPassFromDetails(eval.Details); ok {
 			for _, d := range eval.Details {
-				if MovesEqual(d.Move, m) && d.WinRate >= passWR-threshold2 {
+				if MovesEqual(d.Move, m) && d.WinRate >= 0.02 && d.WinRate >= passWR-threshold2 {
 					return m, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
 				}
 			}
@@ -2344,8 +2360,8 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		}
 	}
 
-	// 2-speler: PASS is in ALLE fases gevaarlijk — tegenstander krijgt vrije open ronde.
-	// Vroeg/midspel: 65% minder passen. Eindspel (<9 kaarten): 90% minder passen.
+	// 2-speler: passen is bijna altijd tempo-verlies — tegenstander krijgt vrije open ronde
+	// en kan ongehinderd doorspelen. Eénmalig passen = nooit meer aan bod komen.
 	{
 		activePlayers2 := 0
 		for i, h := range gs.Hands {
@@ -2354,11 +2370,7 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			}
 		}
 		if activePlayers2 <= 2 {
-			if minOpp < 9 {
-				passChance *= 0.10 // eindspel: vrijwel altijd fataal
-			} else {
-				passChance *= 0.35 // vroeg/midspel: ook gevaarlijk in 2-speler
-			}
+			passChance *= 0.02
 		}
 	}
 
@@ -2586,7 +2598,13 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 	hand := gs.Hands[myID]
 	wilds := hand.CountRank(RankTwo)    // alleen 2 is wildcard
 	resets := hand.CountRank(RankJoker) // joker is reset-kaart
-	score += float64(resets) * 0.33
+	resetBonus := 0.33
+	if activePlayerCount(gs) <= 2 && minOpp >= 6 {
+		// In 2-speler mid-game is de joker uniek waardevol: enige manier om triple aas
+		// te beantwoorden via "022". Zonder joker ben je verplicht te passen op aces.
+		resetBonus = 0.55
+	}
+	score += float64(resets) * resetBonus
 	score += float64(wilds) * 0.38
 	if resets > 0 && wilds > 0 {
 		score += float64(imin(resets, wilds)) * 0.20
@@ -2755,10 +2773,16 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 	// en maakte dat PASS kunstmatig goed scoorde in MCTS rollouts,
 	// omdat rolloutevaluaties met open-ronde-posities altijd ~1.0 teruggaven.
 	if gs.Round.IsOpen && gs.CurrentTurn == myID {
-		score += 0.085 * 1.2
-		if hand.CountResets() > 0 {
-			score += 0.08 // was 0.45 — joker+tempo is sterk maar niet allesbepalend
+		if activePlayerCount(gs) <= 2 {
+			score += 0.20 // 2-speler: open ronde = groot tempo-voordeel
+		} else {
+			score += 0.085 * 1.2
 		}
+		if hand.CountResets() > 0 {
+			score += 0.08
+		}
+	} else if gs.Round.IsOpen && gs.CurrentTurn != myID && activePlayerCount(gs) <= 2 {
+		score -= 0.14 // 2-speler: tegenstander heeft open ronde = jij bent in het nadeel
 	}
 	if score < 0 {
 		score = 0
