@@ -1958,11 +1958,14 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		if bestVisits > 0 {
 			passWR = totalWins[bestKey] / float64(bestVisits)
 		}
-		// Override PASS alleen als:
-		// 1) Er een niet-pass zet is met vergelijkbare of betere winrate (minder dan 3% verschil)
-		// 2) EN de situatie gevaarlijk is (4+ kaarten achter, of 2-speler eindspel met ≤5 opp kaarten)
-		urgent := myCards-oppCards >= 4 || (activePlayerCount(gs) <= 2 && oppCards <= 5)
-		if bestNonPassKey != "" && urgent && (bestNonPassWR >= passWR-0.03) {
+		// Override PASS als situatie gevaarlijk is of tafel zo laag is dat passen bijna nooit zinvol is
+		lowTable := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
+		urgent := myCards-oppCards >= 4 || (activePlayerCount(gs) <= 2 && oppCards <= 5) || lowTable
+		threshold := 0.03
+		if lowTable {
+			threshold = 0.12 // op lage tafel ook override als non-pass tot 12% slechter is
+		}
+		if bestNonPassKey != "" && urgent && (bestNonPassWR >= passWR-threshold) {
 			bestKey = bestNonPassKey
 			bestVisits = totalVisits[bestKey]
 			bestMove = moveMap[bestKey]
@@ -2009,15 +2012,20 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 		e.backprop(node, result, myID)
 	}
 	bestMove, eval := e.pickBest(root, myID)
-	// Pass-override: alleen forceren als situatie urgent is en verschil klein.
+	// Pass-override: forceer non-pass bij urgente situaties of lage tafelrank.
 	myCards2 := gs.Hands[myID].Count()
 	oppCards2 := minOppHandCount(gs, myID)
-	urgent2 := myCards2-oppCards2 >= 4 || (activePlayerCount(gs) <= 2 && oppCards2 <= 5)
+	lowTable2 := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
+	urgent2 := myCards2-oppCards2 >= 4 || (activePlayerCount(gs) <= 2 && oppCards2 <= 5) || lowTable2
 	if bestMove.IsPass && urgent2 {
 		passWR := eval.Score
+		threshold2 := 0.03
+		if lowTable2 {
+			threshold2 = 0.12
+		}
 		if m, ok := bestNonPassFromDetails(eval.Details); ok {
 			for _, d := range eval.Details {
-				if MovesEqual(d.Move, m) && d.WinRate >= passWR-0.03 {
+				if MovesEqual(d.Move, m) && d.WinRate >= passWR-threshold2 {
 					return m, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
 				}
 			}
@@ -2352,6 +2360,11 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 				passChance *= 0.35 // vroeg/midspel: ook gevaarlijk in 2-speler
 			}
 		}
+	}
+
+	// Lage tafel (≤7): passen is bijna nooit zinvol — vrijwel elke kaart verslaat het
+	if !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven {
+		passChance *= 0.04
 	}
 
 	if e.rng.Float64() < passChance {
