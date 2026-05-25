@@ -528,6 +528,9 @@ func (gs *GameState) ValidateMove(m Move) error {
 		return fmt.Errorf("not player %d's turn (current: %d)", m.PlayerID, gs.CurrentTurn)
 	}
 	if m.IsPass {
+		if gs.Round.IsOpen {
+			return fmt.Errorf("cannot pass in an open round — must play")
+		}
 		return nil
 	}
 	if len(m.Cards) == 0 {
@@ -657,12 +660,11 @@ func (gs *GameState) GetLegalMoves() []Move {
 	}
 	pid := gs.CurrentTurn
 	hand := gs.Hands[pid]
-	moves := []Move{PassMove(pid)}
 	if gs.Round.IsOpen {
-		moves = append(moves, genOpenMoves(pid, hand)...)
-	} else {
-		moves = append(moves, genResponseMoves(pid, hand, gs.Round)...)
+		return genOpenMoves(pid, hand)
 	}
+	moves := []Move{PassMove(pid)}
+	moves = append(moves, genResponseMoves(pid, hand, gs.Round)...)
 	return moves
 }
 
@@ -1857,6 +1859,17 @@ func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed 
 	return res
 }
 
+// preferCheaperMove returns true if a is a "cheaper" play than b: lower effective rank,
+// then fewer cards. Used as tiebreaker when win rates are nearly identical.
+func preferCheaperMove(a, b Move, tableRank Rank) bool {
+	rankA := a.EffectiveRank(tableRank)
+	rankB := b.EffectiveRank(tableRank)
+	if rankA != rankB {
+		return rankA < rankB
+	}
+	return len(a.Cards) < len(b.Cards)
+}
+
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
 	if win, depth := findImmediateWin(gs, e.Config.OmniscientMode); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
@@ -1953,7 +1966,10 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 				v := totalVisits[k]
 				if v > 0 {
 					wr2 := totalWins[k] / float64(v)
-					if wr2 > bestNonPassWR {
+					// Prefer higher WR; tiebreak (within 1%) by cheaper move (lower rank)
+					better := wr2 > bestNonPassWR+0.01 ||
+						(wr2 >= bestNonPassWR-0.01 && preferCheaperMove(m, moveMap[bestNonPassKey], gs.Round.TableRank))
+					if better {
 						bestNonPassWR = wr2
 						bestNonPassKey = k
 					}
@@ -1970,7 +1986,7 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		urgent := myCards-oppCards >= 4 || (twoPlayer && oppCards <= 5) || lowTable || twoPlayer
 		threshold := 0.03
 		if twoPlayer {
-			threshold = 0.08 // 2-speler: override pass als spelen max 8% minder scoort
+			threshold = 0.15 // 2-speler: tempo-verlies na pas is ernstig, ruimere override
 		}
 		if lowTable && threshold < 0.07 {
 			threshold = 0.07
@@ -2023,7 +2039,7 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 		result := e.simulate(simGS, myID)
 		e.backprop(node, result, myID)
 	}
-	bestMove, eval := e.pickBest(root, myID)
+	bestMove, eval := e.pickBest(root, myID, gs.Round.TableRank)
 	// Pass-override: forceer non-pass bij urgente situaties of lage tafelrank.
 	myCards2 := gs.Hands[myID].Count()
 	oppCards2 := minOppHandCount(gs, myID)
@@ -2034,12 +2050,12 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 		passWR := eval.Score
 		threshold2 := 0.03
 		if twoPlayer2 {
-			threshold2 = 0.08
+			threshold2 = 0.15
 		}
 		if lowTable2 && threshold2 < 0.07 {
 			threshold2 = 0.07
 		}
-		if m, ok := bestNonPassFromDetails(eval.Details); ok {
+		if m, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
 			for _, d := range eval.Details {
 				if MovesEqual(d.Move, m) && d.WinRate >= 0.02 && d.WinRate >= passWR-threshold2 {
 					return m, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
@@ -2801,7 +2817,7 @@ func (e *Engine) backprop(node *mctsNode, result float64, myID int) {
 	}
 }
 
-func (e *Engine) pickBest(root *mctsNode, myID int) (Move, MoveEval) {
+func (e *Engine) pickBest(root *mctsNode, myID int, tableRank Rank) (Move, MoveEval) {
 	if len(root.children) == 0 {
 		return PassMove(myID), MoveEval{}
 	}
@@ -2818,7 +2834,10 @@ func (e *Engine) pickBest(root *mctsNode, myID int) (Move, MoveEval) {
 		for _, ch := range root.children {
 			if ch.visits >= minV {
 				wr := ch.wins / float64(ch.visits)
-				if wr > bestWR {
+				// Prefer higher WR; tiebreak (within 1%) by cheaper move
+				better := wr > bestWR+0.01 ||
+					(wr >= bestWR-0.01 && bestNode != nil && preferCheaperMove(ch.move, bestNode.move, tableRank))
+				if better {
 					bestWR = wr
 					bestNode = ch
 				}
@@ -2883,15 +2902,20 @@ func activePlayerCount(gs *GameState) int {
 }
 
 // bestNonPassFromDetails geeft de non-pass zet met de hoogste win-rate uit MCTS-details.
-func bestNonPassFromDetails(details []MoveDetail) (Move, bool) {
+// Bij win-rates binnen 1%: voorkeur voor goedkoopste zet (laagste rank, dan minste kaarten).
+func bestNonPassFromDetails(details []MoveDetail, tableRank Rank) (Move, bool) {
 	bestWR := -1.0
 	var bestMove Move
 	found := false
 	for _, d := range details {
-		if !d.Move.IsPass && d.Visits > 0 && d.WinRate > bestWR {
-			bestWR = d.WinRate
-			bestMove = d.Move
-			found = true
+		if !d.Move.IsPass && d.Visits > 0 {
+			better := d.WinRate > bestWR+0.01 ||
+				(d.WinRate >= bestWR-0.01 && found && preferCheaperMove(d.Move, bestMove, tableRank))
+			if better {
+				bestWR = d.WinRate
+				bestMove = d.Move
+				found = true
+			}
 		}
 	}
 	return bestMove, found
@@ -3790,6 +3814,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 		if doAnalysis {
 			forcedWin := bestEval.ForcedWinDepth > 0
 			playedIsBest := MovesEqual(bestMove, move)
+			tempoOverride := !playedIsBest && move.IsPass && !bestMove.IsPass
 			var diff float64
 			emoji := "✅"
 			if !playedIsBest {
@@ -3798,7 +3823,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 					emoji = "❌"
 				} else if diff > 0.15 {
 					emoji = "❌"
-				} else if diff > 0.02 {
+				} else if diff > 0.02 || tempoOverride {
 					emoji = "⚠️ "
 				}
 			}
@@ -3809,11 +3834,15 @@ func analyzeMode(reader *Reader, cfg settings) {
 			} else if forcedWin && playedIsBest {
 				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
 			} else {
-				showBest := !playedIsBest &&
-					(diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
-				if showBest {
-					fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
-						bestLabel, bestEval.Score*100, diff*100)
+				if tempoOverride {
+					fmt.Printf("   ⚡ Tempo-verlies: engine zou spelen — %s\n", bestLabel)
+				} else {
+					showBest := !playedIsBest &&
+						(diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
+					if showBest {
+						fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
+							bestLabel, bestEval.Score*100, diff*100)
+					}
 				}
 			}
 			// Diagnostiek: toon top alternatieven (gesorteerd op score, max 5)
@@ -4013,6 +4042,8 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 		if doAnalysis {
 			forcedWin := bestEval.ForcedWinDepth > 0
 			playedIsBest := MovesEqual(bestMove, move)
+			// Tempo-override: engine beveelt spelen aan maar PASS gespeeld → altijd ⚠️
+			tempoOverride := !playedIsBest && move.IsPass && !bestMove.IsPass
 			var diff float64
 			emoji := "✅"
 			if !playedIsBest {
@@ -4021,7 +4052,7 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 					emoji = "❌"
 				} else if diff > 0.15 {
 					emoji = "❌"
-				} else if diff > 0.02 {
+				} else if diff > 0.02 || tempoOverride {
 					emoji = "⚠️ "
 				}
 			}
@@ -4032,10 +4063,14 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			} else if forcedWin && playedIsBest {
 				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
 			} else {
-				showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
-				if showBest {
-					fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
-						bestLabel, bestEval.Score*100, diff*100)
+				if tempoOverride {
+					fmt.Printf("   ⚡ Tempo-verlies: engine zou spelen — %s\n", bestLabel)
+				} else {
+					showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
+					if showBest {
+						fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
+							bestLabel, bestEval.Score*100, diff*100)
+					}
 				}
 			}
 			// Diagnostiek: toon top alternatieven (gesorteerd op score, max 5)
