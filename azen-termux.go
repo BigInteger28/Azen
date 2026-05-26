@@ -1444,6 +1444,14 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 		mq.Score -= rankValue * 8.0 // hoge kaarten in open ronde = verspilling
 	}
 
+	// Extra straf: wildcards toevoegen aan lage combo in open ronde (bijv. 33322).
+	// Lage rank + wildcards = je benut de wildcard niet strategisch: de tegenstander
+	// beantwoordt even makkelijk met een grotere combo. De wildcards zijn meer waard
+	// als kill-shot of als respons op sterke tafels.
+	if gs.Round.IsOpen && wildsUsed > 0 && resetsUsed == 0 && effectiveRank <= RankSeven {
+		mq.Score -= float64(wildsUsed) * 9.0
+	}
+
 	// Meerdere kaarten tegelijk kwijtraken is goed.
 	mq.Score += float64(len(move.Cards)) * 3.0
 
@@ -1804,12 +1812,14 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 			filtered = append(filtered, m)
 			continue
 		}
-		hasWild, hasReset := false, false
+		hasWild, hasReset, hasNormal := false, false, false
 		for _, c := range m.Cards {
 			if c.IsWild() {
 				hasWild = true
 			} else if c.IsReset() {
 				hasReset = true
+			} else {
+				hasNormal = true
 			}
 		}
 		// Oversized combo filter ("/" zetten met meer kaarten dan de tabelgrootte).
@@ -1846,7 +1856,12 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 			continue
 		}
 		// Geen non-reset zet verslaat de tafel: bewaar alles dat de tafel verslaat.
-		if hasReset || m.EffectiveRank(tableRank) > tableRank {
+		// Uitzondering: pure wildcards op hoge tafel (zoals Aas). EffectiveRank = tableRank
+		// (niet strikt groter), maar wildcards ZIJN een geldige respons in AZEN — ze "slaan"
+		// elke naturelle kaart. Bewaar ze als er geen naturelle opties zijn.
+		isPureWildResponse := hasWild && !hasNormal && !hasReset &&
+			m.EffectiveRank(tableRank) == tableRank && maxNaturalRank == 0
+		if hasReset || m.EffectiveRank(tableRank) > tableRank || isPureWildResponse {
 			filtered = append(filtered, m)
 		}
 	}
@@ -2572,6 +2587,12 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			}
 		}
 		// =====================================================
+
+		// Extra straf: wildcards aan lage combo in open ronde (bijv. 33322 ipv 333).
+		// Wildcards zijn te waardevol om te verspillen aan een lage tafelsetting.
+		if gs.Round.IsOpen && wilds > 0 && resets == 0 && effective <= RankSeven {
+			w *= 0.08 // bijna nooit: wildcard verspillen aan lage open combo
+		}
 
 		// Bonus voor dumpen van lage normale kaarten (4 4 krijgt voorkeur).
 		// ONDERDRUK in eindspel (≤2 kaarten over): dan geldt STRATEGIE, niet dumporde.
@@ -3379,9 +3400,9 @@ type settings struct {
 
 func main() {
 	reader := NewReader()
-	cfg := settings{numThreads: 4}
+	cfg := settings{numThreads: 8}
 	for {
-		PrintHeader("AZEN Engine UPDATE 06")
+		PrintHeader("AZEN Engine UPDATE 07")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
