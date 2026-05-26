@@ -1398,8 +1398,12 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 
 	// Wild-verspilling: scherpere straf naarmate de rank lager is.
 	// Wild op rank 3-5 is catastrofaal; op rank 6-9 is slecht; op 10+ is acceptabel.
+	// UITZONDERING: als de combo ook een reset bevat (joker+wildcard kill-shot) is de straf mild.
 	if wildsUsed > 0 {
-		if effectiveRank <= RankFive {
+		if resetsUsed > 0 {
+			// joker + wildcards als response = kill-shot (bijv. x220): nauwelijks straf
+			mq.Score -= float64(wildsUsed) * 1.0
+		} else if effectiveRank <= RankFive {
 			mq.Score -= float64(wildsUsed) * 12.0
 			mq.WastesWilds = true
 			mq.Reasoning = "Wastes wildcards on very low play"
@@ -1472,6 +1476,33 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 	if gs.Round.IsOpen && resetsUsed > 0 {
 		mq.Score += 10.0
 	}
+
+	// Drain strategie: geïsoleerde single in open ronde bij 2 spelers.
+	// Door een single te spelen dwing je de tegenstander één kaart uit zijn combo te breken.
+	// Dit is sterker dan je eigen quad spelen als je nog 2+ combos in hand hebt.
+	if gs.Round.IsOpen && gs.NumPlayers == 2 &&
+		len(move.Cards) == 1 && normalsUsed == 1 && wildsUsed == 0 && resetsUsed == 0 &&
+		cardsAfter >= 6 {
+		rankCount := hand.CountRank(effectiveRank)
+		if rankCount == 1 {
+			// Kaart is geïsoleerd (geen partner). Tel combos die overblijven.
+			comboCount := 0
+			for r := RankThree; r <= RankAce; r++ {
+				if r == effectiveRank {
+					continue
+				}
+				if hand.CountRank(r) >= 2 {
+					comboCount++
+				}
+			}
+			remWilds := hand.CountRank(RankTwo)
+			remResets := hand.CountRank(RankJoker)
+			if comboCount >= 2 || (comboCount >= 1 && (remWilds+remResets) >= 1) {
+				mq.Score += 11.0 // drain bonus: forceer tegenstander zijn combo te breken
+			}
+		}
+	}
+
 	return mq
 }
 
@@ -2338,7 +2369,7 @@ func (e *Engine) simulate(gs *GameState, myID int) float64 {
 		maxSteps = 800 // bij weinig kaarten ALTIJD tot GameOver, geen evalPos-afbreking
 	}
 	for i := 0; i < maxSteps && !sim.GameOver; i++ {
-		moves := sim.GetLegalMoves()
+		moves := filterDominatedMoves(sim.GetLegalMoves(), sim.Round)
 		if len(moves) == 0 {
 			break
 		}
@@ -2519,22 +2550,25 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		w *= math.Pow(wildPlayFactor, float64(wilds))
 
 		// === WILD-VERSPIJLING STRAF ===
-		if wilds > 0 && handCount >= 12 {           // nog veel kaarten
-			if effective <= RankFive {              // extreem lage beat (zoals 3)
-				w *= 0.09                           // bijna onmogelijk maken
-			} else if effective <= RankEight {
-				w *= 0.28
-			} else if effective <= RankTen {
-				w *= 0.40                           // nieuw: rank 9-10 ook extra straf
-			} else if effective <= RankQueen {
-				w *= 0.40                           // aangescherpt: 0.60→0.40 (Q0 minder aantrekkelijk)
-			}
-			// King+wild: geen extra straf (K is terecht moeilijk anders te spelen)
-		} else if wilds > 0 {
-			if effective <= RankSix {
-				w *= 0.25
-			} else if effective <= RankNine {
-				w *= 0.45                           // iets aangescherpt: 0.50→0.45
+		// SKIP als er ook een reset in de combo zit: joker+wilds = bewuste kill-shot (x220).
+		if wilds > 0 && resets == 0 {
+			if handCount >= 12 {           // nog veel kaarten
+				if effective <= RankFive {              // extreem lage beat (zoals 3)
+					w *= 0.09                           // bijna onmogelijk maken
+				} else if effective <= RankEight {
+					w *= 0.28
+				} else if effective <= RankTen {
+					w *= 0.40
+				} else if effective <= RankQueen {
+					w *= 0.40
+				}
+				// King+wild: geen extra straf (K is terecht moeilijk anders te spelen)
+			} else {
+				if effective <= RankSix {
+					w *= 0.25
+				} else if effective <= RankNine {
+					w *= 0.45
+				}
 			}
 		}
 		// =====================================================
@@ -2549,6 +2583,29 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 				w *= 1.60
 			} else if lowest <= RankEight {
 				w *= 1.30
+			}
+		}
+
+		// Drain strategie: geïsoleerde single in open ronde bij 2 spelers.
+		// Forceer tegenstander zijn combo te breken → sterker dan eigen quad spelen.
+		if gs.Round.IsOpen && gs.NumPlayers == 2 && len(m.Cards) == 1 &&
+			wilds == 0 && resets == 0 && handCount >= 8 {
+			rankCount := curHand.CountRank(effective)
+			if rankCount == 1 {
+				comboCount := 0
+				for r := RankThree; r <= RankAce; r++ {
+					if r == effective {
+						continue
+					}
+					if curHand.CountRank(r) >= 2 {
+						comboCount++
+					}
+				}
+				remWilds := curHand.CountRank(RankTwo)
+				remResets := curHand.CountRank(RankJoker)
+				if comboCount >= 2 || (comboCount >= 1 && (remWilds+remResets) >= 1) {
+					w *= 3.5
+				}
 			}
 		}
 
@@ -2579,12 +2636,14 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 				w *= 2.9 // joker reset als antwoord: sterk maar kostbaar
 			}
 		}
-		if resets > 0 && wilds > 0 && gs.Round.IsOpen {
-			w *= 2.1
-		}
-
+		// Synergy joker + wildcards:
+		// Open ronde: kleine netto-straf (reset+wilds is kostbaar, maar soms nodig).
+		// Antwoord-ronde: GEEN straf — joker+wildcard als response is de kill-shot (x220).
 		if resets > 0 && wilds > 0 {
-			w *= synergyPenalty
+			if gs.Round.IsOpen {
+				w *= 2.1 * synergyPenalty // net ~0.84
+			}
+			// antwoord-ronde: geen synergyPenalty
 		}
 
 		for _, c := range m.Cards {
@@ -2728,16 +2787,22 @@ func (e *Engine) evalPos(gs *GameState, myID int) float64 {
 	if queens > 0 && wilds == 0 && resets == 0 {
 		score -= float64(queens) * 0.032
 	}
-	// Geïsoleerde lage kaarten (3-7): moeilijk te dumpen als single
+	// Geïsoleerde lage kaarten (3-7): moeilijk te dumpen als single.
+	// In 2-speler zijn ze duurder: tegenstander krijgt gratis open ronde als je ze speelt
+	// en ze breken je tempo.
+	isolatedPenalty := 0.042
+	if activePlayerCount(gs) <= 2 {
+		isolatedPenalty = 0.080
+	}
 	for r := RankThree; r <= RankSeven; r++ {
 		if hand.CountRank(r) == 1 && wilds == 0 {
-			score -= 0.042
+			score -= isolatedPenalty
 		}
 	}
 	// Geïsoleerde midden-kaarten (8-X): ook lastig, maar iets minder erg
 	for r := RankEight; r <= RankTen; r++ {
 		if hand.CountRank(r) == 1 && wilds == 0 {
-			score -= 0.042 * 0.5
+			score -= isolatedPenalty * 0.5
 		}
 	}
 	for r := RankThree; r <= RankAce; r++ {
@@ -3316,7 +3381,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 4}
 	for {
-		PrintHeader("AZEN Engine UPDATE 05")
+		PrintHeader("AZEN Engine UPDATE 06")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
@@ -4219,12 +4284,66 @@ func simulateMode(reader *Reader, cfg settings) {
 	if n, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && n >= 2 && n <= 4 {
 		numPlayers = n
 	}
+	fmt.Println()
+	fmt.Println("  [1] Random kaarten")
+	fmt.Println("  [2] Kaarten zelf kiezen")
+	fmt.Println()
+	kaartKeuze := reader.ReadLine("Kies optie (1/2): ")
+
 	sims := 1000
 	if s, err := reader.ReadInt("Engine-simulaties per zet (standaard 1000): "); err == nil && s > 0 {
 		sims = s
 	}
+
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	gs := NewGame(numPlayers, rng, 0)
+	var gs *GameState
+
+	if strings.TrimSpace(kaartKeuze) == "2" {
+		// Kaarten zelf kiezen
+		hands := make([]*Hand, numPlayers)
+		var allDealt []Card
+		for i := 0; i < numPlayers; i++ {
+			for {
+				input := reader.ReadLine(fmt.Sprintf("Kaarten Speler %d (bijv. 22333667777xxk1110): ", i+1))
+				parsed, err := ParseCards(strings.TrimSpace(input))
+				if err != nil {
+					fmt.Printf("⚠️  Ongeldige kaarten: %v — probeer opnieuw.\n", err)
+					continue
+				}
+				hands[i] = NewHand(parsed)
+				allDealt = append(allDealt, parsed...)
+				break
+			}
+		}
+		// Bereken dode kaarten (kaarten die niet uitgedeeld zijn)
+		fullDeck := NewDeck()
+		deckCards := fullDeck.Cards
+		dealtCopy := make([]Card, len(allDealt))
+		copy(dealtCopy, allDealt)
+		var dead []Card
+		for _, dc := range deckCards {
+			found := false
+			for j, ec := range dealtCopy {
+				if ec.Rank == dc.Rank {
+					dealtCopy = append(dealtCopy[:j], dealtCopy[j+1:]...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				dead = append(dead, dc)
+			}
+		}
+		startPlayer := 0
+		if sp, err := reader.ReadInt(fmt.Sprintf("Welke speler begint? (1-%d): ", numPlayers)); err == nil && sp >= 1 && sp <= numPlayers {
+			startPlayer = sp - 1
+		}
+		gs = NewGameWithHands(hands, dead, startPlayer)
+	} else {
+		// Random kaarten
+		startPlayer := 0
+		gs = NewGame(numPlayers, rng, startPlayer)
+	}
 	fmt.Println("\nStarthanden:")
 	for i := 0; i < numPlayers; i++ {
 		fmt.Printf("Speler %d: %s\n", i+1, gs.Hands[i])
