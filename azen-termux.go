@@ -2027,6 +2027,37 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		if lowTable && threshold < 0.07 {
 			threshold = 0.07
 		}
+		// In 2-speler + lage tafel: MCTS onderschat systematisch de kosten van passen.
+		// Na een pas reset de ronde direct (passThreshold=1) en krijgt de tegenstander
+		// een vrije open ronde. De MCTS exploreert deze brede subtree onvoldoende,
+		// waardoor PASS een opgeblazen winrate krijgt. Verhoog de drempel fors.
+		if twoPlayer && lowTable {
+			threshold = 0.22
+		}
+		// Harde override: als er naturelle zetten beschikbaar zijn (geen wilds/joker nodig)
+		// en de tafel erg laag is (≤ Rank 5) in 2-speler, speel ALTIJD.
+		// MCTS-schattingen zijn hier onbetrouwbaar — de engine MOET spelen bij lage tafel.
+		if bestNonPassKey != "" && twoPlayer && !gs.Round.IsOpen &&
+			gs.Round.TableRank > 0 && gs.Round.TableRank <= RankFive {
+			for _, m := range rootFiltered {
+				if m.IsPass {
+					continue
+				}
+				allNatural := true
+				for _, c := range m.Cards {
+					if c.IsWild() || c.IsReset() {
+						allNatural = false
+						break
+					}
+				}
+				if allNatural && bestNonPassWR >= 0.02 {
+					bestKey = bestNonPassKey
+					bestVisits = totalVisits[bestKey]
+					bestMove = moveMap[bestKey]
+					break
+				}
+			}
+		}
 		// Minimumdrempel: override nooit naar een vrijwel kansloze zet (< 2% winstkans).
 		// Bijv. "022" op triple aas geeft 0.4% — veel slechter dan passen (joker bewaren).
 		if bestNonPassKey != "" && urgent && bestNonPassWR >= 0.02 && (bestNonPassWR >= passWR-threshold) {
@@ -2090,6 +2121,34 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 		}
 		if lowTable2 && threshold2 < 0.07 {
 			threshold2 = 0.07
+		}
+		if twoPlayer2 && lowTable2 {
+			threshold2 = 0.22
+		}
+		// Harde override: naturelle zet + lage tafel (≤5) + 2-speler → altijd spelen.
+		if twoPlayer2 && !gs.Round.IsOpen && gs.Round.TableRank > 0 && gs.Round.TableRank <= RankFive {
+			for _, m := range rootFiltered {
+				if m.IsPass {
+					continue
+				}
+				allNatural := true
+				for _, c := range m.Cards {
+					if c.IsWild() || c.IsReset() {
+						allNatural = false
+						break
+					}
+				}
+				if allNatural {
+					if bm, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
+						for _, d := range eval.Details {
+							if MovesEqual(d.Move, bm) && d.WinRate >= 0.02 {
+								return bm, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
+							}
+						}
+					}
+					break
+				}
+			}
 		}
 		if m, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
 			for _, d := range eval.Details {
@@ -3255,7 +3314,7 @@ type settings struct {
 
 func main() {
 	reader := NewReader()
-	cfg := settings{numThreads: 2}
+	cfg := settings{numThreads: 4}
 	for {
 		PrintHeader("AZEN Engine UPDATE 05")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
