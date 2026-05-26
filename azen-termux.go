@@ -1059,8 +1059,12 @@ func NewKnowledgeTracker(numPlayers, myID int, myHand *Hand, deadCards []Card) *
 		Exclusions:     map[int]map[Rank]int{},
 	}
 	copy(kt.DeadCards, deadCards)
+	startCount := myHand.Count()
+	if startCount == 0 {
+		startCount = 18
+	}
 	for i := range kt.HandCounts {
-		kt.HandCounts[i] = 18
+		kt.HandCounts[i] = startCount
 	}
 	// Spelregel: elke speler krijgt bij de verdeling gegarandeerd minstens 1 wildcard (2).
 	// → Voeg voor elke tegenstander 1 Twee toe als zekere suspicion.
@@ -1427,12 +1431,18 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 
 	// Response-context: bij een response-ronde is de LAAGSTE winnende zet het best.
 	// Je wilt sterke kaarten bewaren voor later. Straf proportioneel aan "overshoot".
+	// Uitzondering: als je na de zet nog maar 1 kaart overhoudt (eindspel 2-kaarten),
+	// is de HOOGSTE zet beter — dwing tegenstander tot passen of speciale kaart.
 	if !gs.Round.IsOpen && effectiveRank > 0 {
 		overshoot := float64(effectiveRank-gs.Round.TableRank) - 1.0
 		if overshoot < 0 {
 			overshoot = 0
 		}
-		mq.Score -= overshoot * 3.0 // bijv. Queen op een 6 tafel = -15 (overshoot 5)
+		if cardsAfter == 1 {
+			mq.Score += overshoot * 2.0 // eindspel: hogere kaart = beter
+		} else {
+			mq.Score -= overshoot * 3.0 // bijv. Queen op een 6 tafel = -15 (overshoot 5)
+		}
 	}
 
 	// Open ronde: lage kaarten dumpen is goed — MAAR alleen als je daarna
@@ -2678,7 +2688,8 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		// Response-overshoot: in response-rondes de LAAGSTE winnende zet prefereren.
 		// KK op een X-tafel is verspilling als JJ of QQ ook wint.
 		// Exponentiële afname: elke rank boven het minimum kost ~15% gewicht.
-		if !gs.Round.IsOpen && wilds == 0 && resets == 0 && effective > gs.Round.TableRank {
+		// Uitzondering: ≤2 kaarten in hand = eindspel, hogere zet is beter.
+		if !gs.Round.IsOpen && wilds == 0 && resets == 0 && effective > gs.Round.TableRank && handCount >= 3 {
 			overshoot := float64(effective-gs.Round.TableRank) - 1.0
 			if overshoot > 0 {
 				w *= math.Pow(0.85, overshoot)
@@ -2687,8 +2698,11 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 
 		// Aas-bescherming: Aas niet verspillen op lage tafel als goedkopere opties bestaan.
 		// De Aas is het ultieme wapen tegen Heer/Aas van de tegenstander.
+		// Uitzondering: eindspel met ≤2 kaarten — dan IS de Aas de juiste zet.
 		if effective == RankAce && !gs.Round.IsOpen && gs.Round.TableRank <= RankJack {
-			w *= 0.15
+			if handCount >= 3 {
+				w *= 0.15
+			}
 		}
 
 		// Near-win bonus: als je na deze zet ≤3 kaarten overhoudt, verhoog het gewicht
@@ -3402,7 +3416,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8}
 	for {
-		PrintHeader("AZEN Engine UPDATE 07")
+		PrintHeader("AZEN Engine UPDATE 08")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
