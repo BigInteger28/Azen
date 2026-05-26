@@ -2089,6 +2089,55 @@ func findForcedWinVsOneCard(gs *GameState) (*Move, int) {
 	return nil, 0
 }
 
+// findForcedWinVsOneCardResponse: response ronde, tegenstander heeft 1 kaart,
+// engine heeft een joker. Speelt de joker (reset) als antwoord om de ronde te
+// openen, en controleert dan via canForceWinVsOneCard of engine gegarandeerd wint.
+// Hiermee wordt de combinatie "0/7777 - 6" gevonden die MCTS mist in play mode.
+func findForcedWinVsOneCardResponse(gs *GameState) (*Move, int) {
+	if gs.Round.IsOpen || gs.NumPlayers != 2 {
+		return nil, 0
+	}
+	pid := gs.CurrentTurn
+	oppID := 1 - pid
+	if gs.Hands[oppID].Count() != 1 {
+		return nil, 0
+	}
+	if gs.Hands[pid].CountRank(RankJoker) == 0 {
+		return nil, 0
+	}
+	moves := genResponseMoves(pid, gs.Hands[pid], gs.Round)
+	var bestMove *Move
+	bestDepth := 999
+	for i := range moves {
+		m := &moves[i]
+		if !m.ContainsReset() {
+			continue
+		}
+		sim := gs.Clone()
+		sim.ApplyMove(*m)
+		if sim.GameOver && sim.Winner == pid {
+			mv := *m
+			return &mv, 1
+		}
+		// Na joker-reset: open ronde met pid aan beurt
+		if !sim.Round.IsOpen || sim.CurrentTurn != pid {
+			continue
+		}
+		if ok, d := canForceWinVsOneCard(pid, sim.Hands[pid], 0); ok {
+			totalDepth := d + 1 // +1 voor de joker-zet zelf
+			if totalDepth < bestDepth {
+				bestDepth = totalDepth
+				mv := *m
+				bestMove = &mv
+			}
+		}
+	}
+	if bestMove != nil {
+		return bestMove, bestDepth
+	}
+	return nil, 0
+}
+
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
 	if win, depth := findImmediateWin(gs, e.Config.OmniscientMode); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
@@ -2097,6 +2146,9 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 		return *forced, MoveEval{Score: 1.0, Visits: 1}
 	}
 	if win, depth := findForcedWinVsOneCard(gs); win != nil {
+		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
+	}
+	if win, depth := findForcedWinVsOneCardResponse(gs); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
 	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
@@ -3562,7 +3614,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8}
 	for {
-		PrintHeader("AZEN Engine UPDATE 09")
+		PrintHeader("AZEN Engine UPDATE 10")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
