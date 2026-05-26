@@ -1773,14 +1773,12 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 			filtered = append(filtered, m)
 			continue
 		}
-		hasWild, hasReset, hasNormal := false, false, false
+		hasWild, hasReset := false, false
 		for _, c := range m.Cards {
 			if c.IsWild() {
 				hasWild = true
 			} else if c.IsReset() {
 				hasReset = true
-			} else {
-				hasNormal = true
 			}
 		}
 		// Oversized combo filter ("/" zetten met meer kaarten dan de tabelgrootte).
@@ -1798,13 +1796,12 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 		// Hiërarchie van "kostprijs": natural < wild-only < wild+reset of reset+normal.
 		// Gebruik altijd de goedkoopste effectieve optie.
 
-		// Als naturelle zetten de tafel al verslaan:
-		// bewaar ALLEEN pure joker-resets (geven tempo zonder wildcards te kosten).
-		// Alles met wildcards of normale kaarten naast de joker is verspilling.
+		// Als naturelle zetten de tafel al verslaan: filter ALLE speciale zetten.
+		// Jokers zijn te waardevol om te verspillen als naturellen al werken —
+		// ook "pure" joker-resets (00) zijn hier verspilling: je krijgt waarschijnlijk
+		// toch de open ronde als de tegenstander niet kan beantwoorden, en anders
+		// heb je je jokers bewaard voor een kritiek moment.
 		if maxNaturalRank > tableRank {
-			if hasReset && !hasNormal && !hasWild {
-				filtered = append(filtered, m) // pure joker: tempo-zet
-			}
 			continue
 		}
 		// Naturelle zetten kunnen de tafel niet verslaan.
@@ -1822,6 +1819,45 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 			filtered = append(filtered, m)
 		}
 	}
+
+	// Post-filter: verwijder reset-zetten met te veel jokers als goedkopere reset-opties
+	// beschikbaar zijn. "J0" domineert "00": zelfde reset-effect, één joker minder verspild.
+	// Bijv. als J0 of Q0 beschikbaar zijn, moet 00 gefilterd worden.
+	minResetCount := 999
+	for _, m := range filtered {
+		if m.IsPass {
+			continue
+		}
+		rc := 0
+		for _, c := range m.Cards {
+			if c.IsReset() {
+				rc++
+			}
+		}
+		if rc > 0 && rc < minResetCount {
+			minResetCount = rc
+		}
+	}
+	if minResetCount < 999 {
+		keep := filtered[:0]
+		for _, m := range filtered {
+			if m.IsPass {
+				keep = append(keep, m)
+				continue
+			}
+			rc := 0
+			for _, c := range m.Cards {
+				if c.IsReset() {
+					rc++
+				}
+			}
+			if rc == 0 || rc <= minResetCount {
+				keep = append(keep, m)
+			}
+		}
+		filtered = keep
+	}
+
 	return filtered
 }
 
@@ -3221,7 +3257,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 2}
 	for {
-		PrintHeader("AZEN Engine v1.0")
+		PrintHeader("AZEN Engine UPDATE 05")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
