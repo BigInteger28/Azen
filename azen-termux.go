@@ -1059,12 +1059,8 @@ func NewKnowledgeTracker(numPlayers, myID int, myHand *Hand, deadCards []Card) *
 		Exclusions:     map[int]map[Rank]int{},
 	}
 	copy(kt.DeadCards, deadCards)
-	startCount := myHand.Count()
-	if startCount == 0 {
-		startCount = 18
-	}
 	for i := range kt.HandCounts {
-		kt.HandCounts[i] = startCount
+		kt.HandCounts[i] = 18
 	}
 	// Spelregel: elke speler krijgt bij de verdeling gegarandeerd minstens 1 wildcard (2).
 	// → Voeg voor elke tegenstander 1 Twee toe als zekere suspicion.
@@ -1431,14 +1427,20 @@ func QuickEvaluateMove(gs *GameState, move Move) MoveQuality {
 
 	// Response-context: bij een response-ronde is de LAAGSTE winnende zet het best.
 	// Je wilt sterke kaarten bewaren voor later. Straf proportioneel aan "overshoot".
-	// Uitzondering: als je na de zet nog maar 1 kaart overhoudt (eindspel 2-kaarten),
-	// is de HOOGSTE zet beter — dwing tegenstander tot passen of speciale kaart.
+	// Uitzondering 1: als je na de zet nog maar 1 kaart overhoudt (eindspel 2-kaarten).
+	// Uitzondering 2: tegenstander heeft nog maar 1 kaart — die is sowieso zijn sterkste.
+	//   Speel dan je hoogste kaart om hem te dwingen tot passen of een speciale kaart.
 	if !gs.Round.IsOpen && effectiveRank > 0 {
 		overshoot := float64(effectiveRank-gs.Round.TableRank) - 1.0
 		if overshoot < 0 {
 			overshoot = 0
 		}
-		if cardsAfter == 1 {
+		opponentHasOne := false
+		if gs.NumPlayers == 2 {
+			opponentID := 1 - gs.CurrentTurn
+			opponentHasOne = gs.Hands[opponentID].Count() == 1
+		}
+		if cardsAfter == 1 || opponentHasOne {
 			mq.Score += overshoot * 2.0 // eindspel: hogere kaart = beter
 		} else {
 			mq.Score -= overshoot * 3.0 // bijv. Queen op een 6 tafel = -15 (overshoot 5)
@@ -2688,8 +2690,13 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 		// Response-overshoot: in response-rondes de LAAGSTE winnende zet prefereren.
 		// KK op een X-tafel is verspilling als JJ of QQ ook wint.
 		// Exponentiële afname: elke rank boven het minimum kost ~15% gewicht.
-		// Uitzondering: ≤2 kaarten in hand = eindspel, hogere zet is beter.
-		if !gs.Round.IsOpen && wilds == 0 && resets == 0 && effective > gs.Round.TableRank && handCount >= 3 {
+		// Uitzondering: ≤2 kaarten in hand of tegenstander heeft 1 kaart = eindspel.
+		opponentHasOne := false
+		if !gs.Round.IsOpen && gs.NumPlayers == 2 {
+			opponentID := 1 - gs.CurrentTurn
+			opponentHasOne = gs.Hands[opponentID].Count() == 1
+		}
+		if !gs.Round.IsOpen && wilds == 0 && resets == 0 && effective > gs.Round.TableRank && handCount >= 3 && !opponentHasOne {
 			overshoot := float64(effective-gs.Round.TableRank) - 1.0
 			if overshoot > 0 {
 				w *= math.Pow(0.85, overshoot)
@@ -2698,9 +2705,9 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 
 		// Aas-bescherming: Aas niet verspillen op lage tafel als goedkopere opties bestaan.
 		// De Aas is het ultieme wapen tegen Heer/Aas van de tegenstander.
-		// Uitzondering: eindspel met ≤2 kaarten — dan IS de Aas de juiste zet.
+		// Uitzondering: eindspel met ≤2 kaarten of tegenstander heeft 1 kaart.
 		if effective == RankAce && !gs.Round.IsOpen && gs.Round.TableRank <= RankJack {
-			if handCount >= 3 {
+			if handCount >= 3 && !opponentHasOne {
 				w *= 0.15
 			}
 		}
@@ -4391,6 +4398,10 @@ func simulateMode(reader *Reader, cfg settings) {
 		engConfig.Iterations = sims
 		engConfig.NumWorkers = cfg.numThreads
 		trackers[i] = NewKnowledgeTracker(numPlayers, i, gs.Hands[i], gs.DeadCards)
+		// Overschrijf HandCounts met werkelijke startgroottes (belangrijk bij custom handen)
+		for j := 0; j < numPlayers; j++ {
+			trackers[i].HandCounts[j] = gs.Hands[j].Count()
+		}
 		engines[i] = NewEngine(engConfig)
 	}
 	prevFinished := 0
