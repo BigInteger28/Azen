@@ -1964,8 +1964,139 @@ func preferCheaperMove(a, b Move, tableRank Rank) bool {
 	return len(a.Cards) < len(b.Cards)
 }
 
+// findForcedHighResponse detecteert de "schaakmat-verdediging":
+// als tegenstander 1 kaart heeft, jij 1 kaart MOET spelen, en je geen joker hebt,
+// is de hoogste kaart spelen altijd de enige correcte zet — geen MCTS nodig.
+func findForcedHighResponse(gs *GameState) *Move {
+	if gs.Round.IsOpen || gs.Round.Count != 1 || gs.NumPlayers != 2 {
+		return nil
+	}
+	pid := gs.CurrentTurn
+	if gs.Hands[1-pid].Count() != 1 {
+		return nil
+	}
+	if gs.Hands[pid].CountRank(RankJoker) > 0 {
+		return nil // joker aanwezig: MCTS beslist of joker beter is
+	}
+	moves := gs.GetLegalMoves()
+	var best *Move
+	bestER := Rank(0)
+	bestIsWild := false
+	for i := range moves {
+		m := &moves[i]
+		if m.IsPass || len(m.Cards) != 1 || m.Cards[0].IsReset() {
+			continue
+		}
+		er := m.EffectiveRank(gs.Round.TableRank)
+		isWild := m.Cards[0].IsWild()
+		// Geldig: naturelle kaart die tafel verslaat, of pure wildcard (enige optie op Aas-tafel)
+		if er <= gs.Round.TableRank && !isWild {
+			continue
+		}
+		// Kies hoogste; bij gelijke rank geef voorkeur aan naturel boven wildcard
+		if best == nil || er > bestER || (er == bestER && bestIsWild && !isWild) {
+			best = m
+			bestER = er
+			bestIsWild = isWild
+		}
+	}
+	return best
+}
+
+// canForceWinVsOneCard: recursieve helper — kan speler `pid` zijn hand leegspelen
+// via een reeks open zetten waarbij de tegenstander (1 kaart) altijd moet passen?
+// Geeft (true, diepte) terug: diepte = aantal eigen zetten tot winst.
+func canForceWinVsOneCard(pid int, hand *Hand, depth int) (bool, int) {
+	if depth > 15 {
+		return false, 0
+	}
+	count := hand.Count()
+	if count == 0 {
+		return true, 0
+	}
+	bestDepth := 999
+	found := false
+	for _, m := range genOpenMoves(pid, hand) {
+		n := len(m.Cards)
+		if n == count {
+			if 1 < bestDepth {
+				bestDepth = 1
+				found = true
+			}
+			continue
+		}
+		if n >= 2 || m.ContainsReset() {
+			newHand := hand.Clone()
+			if err := newHand.Remove(m.Cards); err != nil {
+				continue
+			}
+			if ok, d := canForceWinVsOneCard(pid, newHand, depth+1); ok {
+				if d+1 < bestDepth {
+					bestDepth = d + 1
+					found = true
+				}
+			}
+		}
+	}
+	return found, bestDepth
+}
+
+// findForcedWinVsOneCard: open ronde, tegenstander heeft 1 kaart.
+// Geeft de eerste zet van een gegarandeerde winreeks terug met exacte diepte.
+func findForcedWinVsOneCard(gs *GameState) (*Move, int) {
+	if !gs.Round.IsOpen || gs.NumPlayers != 2 {
+		return nil, 0
+	}
+	pid := gs.CurrentTurn
+	if gs.Hands[1-pid].Count() != 1 {
+		return nil, 0
+	}
+	hand := gs.Hands[pid]
+	if hand.Count() == 0 {
+		return nil, 0
+	}
+	moves := genOpenMoves(pid, hand)
+	var bestMove *Move
+	bestDepth := 999
+	for i := range moves {
+		m := &moves[i]
+		n := len(m.Cards)
+		remaining := hand.Count() - n
+		if remaining == 0 {
+			if 1 < bestDepth {
+				bestDepth = 1
+				bestMove = m
+			}
+			continue
+		}
+		if n >= 2 || m.ContainsReset() {
+			newHand := hand.Clone()
+			if err := newHand.Remove(m.Cards); err != nil {
+				continue
+			}
+			if ok, d := canForceWinVsOneCard(pid, newHand, 0); ok {
+				totalDepth := d + 1
+				if totalDepth < bestDepth {
+					bestDepth = totalDepth
+					bestMove = m
+				}
+			}
+		}
+	}
+	if bestMove != nil {
+		return bestMove, bestDepth
+	}
+	return nil, 0
+}
+
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
 	if win, depth := findImmediateWin(gs, e.Config.OmniscientMode); win != nil {
+		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
+	}
+	if forced := findForcedHighResponse(gs); forced != nil {
+		return *forced, MoveEval{Score: 1.0, Visits: 1}
+	}
+	if win, depth := findForcedWinVsOneCard(gs); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
 	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
@@ -2712,6 +2843,14 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 			}
 		}
 
+		// Tegenstander heeft 1 kaart: speel HOOG om passen of speciale kaart te dwingen.
+		// Zijn resterende kaart is sowieso zijn sterkste — laagste response = gratis verlies.
+		// Exponentieel hogere boost voor hogere ranks om low-rank bias te compenseren.
+		if !gs.Round.IsOpen && opponentHasOne && wilds == 0 && resets == 0 && effective > gs.Round.TableRank {
+			overshootHigh := float64(effective-gs.Round.TableRank) - 1.0
+			w *= math.Pow(1.45, overshootHigh+1)
+		}
+
 		// Near-win bonus: als je na deze zet ≤3 kaarten overhoudt, verhoog het gewicht
 		// sterk. Dit overstijgt rank-voorkeur en dump-bonussen in de eindspelfase.
 		// Bijv. QQQ (cardsAfter=1) wint terecht van 5 (cardsAfter=3) bij {5,Q,Q,Q}.
@@ -3423,7 +3562,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8}
 	for {
-		PrintHeader("AZEN Engine UPDATE 08")
+		PrintHeader("AZEN Engine UPDATE 09")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
