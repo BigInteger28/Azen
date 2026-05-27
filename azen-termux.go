@@ -2252,95 +2252,6 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 			}
 		}
 	}
-	bestMove := moveMap[bestKey]
-	// Pass-override: alleen forceren als PASS duidelijk slechter is dan de beste
-	// speel-zet, EN de situatie gevaarlijk is (speler staat ver achter).
-	// Voorheen overschreef dit PASS altijd in 2-speler, zelfs als PASS objectief beter was.
-	myID := gs.CurrentTurn
-	myCards := gs.Hands[myID].Count()
-	oppCards := minOppHandCount(gs, myID)
-	if bestMove.IsPass {
-		bestNonPassKey := ""
-		bestNonPassWR := -1.0
-		for k, m := range moveMap {
-			if !m.IsPass {
-				v := totalVisits[k]
-				if v > 0 {
-					wr2 := totalWins[k] / float64(v)
-					// Prefer higher WR; tiebreak (within 1%) by cheaper move (lower rank)
-					better := wr2 > bestNonPassWR+0.01 ||
-						(wr2 >= bestNonPassWR-0.01 && preferCheaperMove(m, moveMap[bestNonPassKey], gs.Round.TableRank))
-					if better {
-						bestNonPassWR = wr2
-						bestNonPassKey = k
-					}
-				}
-			}
-		}
-		passWR := 0.0
-		if bestVisits > 0 {
-			passWR = totalWins[bestKey] / float64(bestVisits)
-		}
-		// Override PASS als situatie gevaarlijk is of tafel zo laag is dat passen bijna nooit zinvol is
-		lowTable := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
-		twoPlayer := activePlayerCount(gs) <= 2
-		// Dreigend scenario multi-player: leidende tegenstander staat dicht bij winst
-		threatenedMulti := !twoPlayer && oppCards <= 6 && myCards-oppCards >= 4
-		urgent := myCards-oppCards >= 4 || (twoPlayer && oppCards <= 5) || lowTable || twoPlayer || threatenedMulti
-		threshold := 0.03
-		if twoPlayer {
-			threshold = 0.15 // 2-speler: tempo-verlies na pas is ernstig, ruimere override
-		} else if threatenedMulti {
-			// 3+ speler: leidende tegenstander ≤6 kaarten en engine ver achter →
-			// druk uitoefenen is nu cruciaal. MCTS onderschat deze dreiging.
-			threshold = 0.12
-		}
-		if lowTable && threshold < 0.07 {
-			threshold = 0.07
-		}
-		// In 2-speler + lage tafel: MCTS onderschat systematisch de kosten van passen.
-		// Na een pas reset de ronde direct (passThreshold=1) en krijgt de tegenstander
-		// een vrije open ronde. De MCTS exploreert deze brede subtree onvoldoende,
-		// waardoor PASS een opgeblazen winrate krijgt. Verhoog de drempel fors.
-		if twoPlayer && lowTable {
-			threshold = 0.22
-		}
-		// Harde override: als er naturelle zetten beschikbaar zijn (geen wilds/joker nodig)
-		// en de tafel erg laag is (≤ Rank 5) in 2-speler, speel ALTIJD.
-		// MCTS-schattingen zijn hier onbetrouwbaar — de engine MOET spelen bij lage tafel.
-		if bestNonPassKey != "" && twoPlayer && !gs.Round.IsOpen &&
-			gs.Round.TableRank > 0 && gs.Round.TableRank <= RankFive {
-			for _, m := range rootFiltered {
-				if m.IsPass {
-					continue
-				}
-				allNatural := true
-				for _, c := range m.Cards {
-					if c.IsWild() || c.IsReset() {
-						allNatural = false
-						break
-					}
-				}
-				if allNatural && bestNonPassWR >= 0.02 {
-					bestKey = bestNonPassKey
-					bestVisits = totalVisits[bestKey]
-					bestMove = moveMap[bestKey]
-					break
-				}
-			}
-		}
-		// Minimumdrempel: override nooit naar een vrijwel kansloze zet (< 2% winstkans).
-		// Bijv. "022" op triple aas geeft 0.4% — veel slechter dan passen (joker bewaren).
-		if bestNonPassKey != "" && urgent && bestNonPassWR >= 0.02 && (bestNonPassWR >= passWR-threshold) {
-			bestKey = bestNonPassKey
-			bestVisits = totalVisits[bestKey]
-			bestMove = moveMap[bestKey]
-		}
-	}
-	wr := 0.0
-	if bestVisits > 0 {
-		wr = totalWins[bestKey] / float64(bestVisits)
-	}
 	details := make([]MoveDetail, 0, len(moveMap))
 	for k, m := range moveMap {
 		v := totalVisits[k]
@@ -2357,7 +2268,14 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 			}
 		}
 	}
-	return bestMove, MoveEval{Score: wr, Visits: bestVisits, Details: details, TotalIters: totalMctsIters, ElapsedMs: mctsElapsedMs}
+	bestMove := moveMap[bestKey]
+	wr := 0.0
+	if bestVisits > 0 {
+		wr = totalWins[bestKey] / float64(bestVisits)
+	}
+	eval := MoveEval{Score: wr, Visits: bestVisits, Details: details, TotalIters: totalMctsIters, ElapsedMs: mctsElapsedMs}
+	bestMove, eval = overridePass(bestMove, eval, gs, rootFiltered)
+	return bestMove, eval
 }
 
 func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltered []Move) (Move, MoveEval) {
@@ -2384,60 +2302,7 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 	bestMove, eval := e.pickBest(root, myID, gs.Round.TableRank)
 	eval.TotalIters = actualIters
 	eval.ElapsedMs = singleElapsedMs
-	// Pass-override: forceer non-pass bij urgente situaties of lage tafelrank.
-	myCards2 := gs.Hands[myID].Count()
-	oppCards2 := minOppHandCount(gs, myID)
-	lowTable2 := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
-	twoPlayer2 := activePlayerCount(gs) <= 2
-	threatenedMulti2 := !twoPlayer2 && oppCards2 <= 6 && myCards2-oppCards2 >= 4
-	urgent2 := myCards2-oppCards2 >= 4 || (twoPlayer2 && oppCards2 <= 5) || lowTable2 || twoPlayer2 || threatenedMulti2
-	if bestMove.IsPass && urgent2 {
-		passWR := eval.Score
-		threshold2 := 0.03
-		if twoPlayer2 {
-			threshold2 = 0.15
-		} else if threatenedMulti2 {
-			threshold2 = 0.12
-		}
-		if lowTable2 && threshold2 < 0.07 {
-			threshold2 = 0.07
-		}
-		if twoPlayer2 && lowTable2 {
-			threshold2 = 0.22
-		}
-		// Harde override: naturelle zet + lage tafel (≤5) + 2-speler → altijd spelen.
-		if twoPlayer2 && !gs.Round.IsOpen && gs.Round.TableRank > 0 && gs.Round.TableRank <= RankFive {
-			for _, m := range rootFiltered {
-				if m.IsPass {
-					continue
-				}
-				allNatural := true
-				for _, c := range m.Cards {
-					if c.IsWild() || c.IsReset() {
-						allNatural = false
-						break
-					}
-				}
-				if allNatural {
-					if bm, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
-						for _, d := range eval.Details {
-							if MovesEqual(d.Move, bm) && d.WinRate >= 0.02 {
-								return bm, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
-							}
-						}
-					}
-					break
-				}
-			}
-		}
-		if m, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
-			for _, d := range eval.Details {
-				if MovesEqual(d.Move, m) && d.WinRate >= 0.02 && d.WinRate >= passWR-threshold2 {
-					return m, MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details}
-				}
-			}
-		}
-	}
+	bestMove, eval = overridePass(bestMove, eval, gs, rootFiltered)
 	return bestMove, eval
 }
 
@@ -3365,6 +3230,74 @@ func bestNonPassFromDetails(details []MoveDetail, tableRank Rank) (Move, bool) {
 	return bestMove, found
 }
 
+// overridePass vervangt een MCTS-PASS door de beste speel-zet als de situatie urgent is.
+// Retourneert de finale zet en een bijgewerkte MoveEval (score/visits van de override-zet).
+func overridePass(bestMove Move, eval MoveEval, gs *GameState, rootFiltered []Move) (Move, MoveEval) {
+	if !bestMove.IsPass {
+		return bestMove, eval
+	}
+	myID := gs.CurrentTurn
+	myCards := gs.Hands[myID].Count()
+	oppCards := minOppHandCount(gs, myID)
+	lowTable := !gs.Round.IsOpen && gs.Round.TableRank <= RankSeven
+	twoPlayer := activePlayerCount(gs) <= 2
+	threatenedMulti := !twoPlayer && oppCards <= 6 && myCards-oppCards >= 4
+	urgent := myCards-oppCards >= 4 || (twoPlayer && oppCards <= 5) || lowTable || twoPlayer || threatenedMulti
+	if !urgent {
+		return bestMove, eval
+	}
+	passWR := eval.Score
+	threshold := 0.03
+	if twoPlayer {
+		threshold = 0.15
+	} else if threatenedMulti {
+		threshold = 0.12
+	}
+	if lowTable && threshold < 0.07 {
+		threshold = 0.07
+	}
+	if twoPlayer && lowTable {
+		threshold = 0.22
+	}
+	withStats := func(d MoveDetail) MoveEval {
+		return MoveEval{Score: d.WinRate, Visits: d.Visits, Details: eval.Details, TotalIters: eval.TotalIters, ElapsedMs: eval.ElapsedMs}
+	}
+	// Harde override: naturelle zet + lage tafel (≤5) + 2-speler → altijd spelen.
+	if twoPlayer && !gs.Round.IsOpen && gs.Round.TableRank > 0 && gs.Round.TableRank <= RankFive {
+		for _, m := range rootFiltered {
+			if m.IsPass {
+				continue
+			}
+			allNatural := true
+			for _, c := range m.Cards {
+				if c.IsWild() || c.IsReset() {
+					allNatural = false
+					break
+				}
+			}
+			if allNatural {
+				if bm, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
+					for _, d := range eval.Details {
+						if MovesEqual(d.Move, bm) && d.WinRate >= 0.02 {
+							return bm, withStats(d)
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+	// Zachte override: threshold-gebaseerd.
+	if m, ok := bestNonPassFromDetails(eval.Details, gs.Round.TableRank); ok {
+		for _, d := range eval.Details {
+			if MovesEqual(d.Move, m) && d.WinRate >= 0.02 && d.WinRate >= passWR-threshold {
+				return m, withStats(d)
+			}
+		}
+	}
+	return bestMove, eval
+}
+
 func (e *Engine) AnalyzeMove(gs *GameState, kt *KnowledgeTracker, m Move) MoveDetail {
 	myID := gs.CurrentTurn
 	wins := 0.0
@@ -3665,7 +3598,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8}
 	for {
-		PrintHeader("AZEN Engine UPDATE 11")
+		PrintHeader("AZEN Engine UPDATE 12")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
