@@ -2186,6 +2186,99 @@ func findForcedWinVsOneCardResponse(gs *GameState) (*Move, int) {
 	return nil, 0
 }
 
+// findForcedLoss detecteert of de huidige speler in een gedwongen verlies-positie zit
+// en vindt diens beste vertragingszet (de zet die het verlies het langste uitstelt).
+// Enkel van toepassing bij bekende handen (omniscient mode) en ≤12 totale kaarten.
+// Retourneert (bestDelayMove, maxDelay) waarbij maxDelay = max. tegenstander-beurten
+// tot verlies na de beste vertragingszet. Geeft (nil, 0) terug als niet van toepassing.
+func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
+	if !knownHands || gs.GameOver {
+		return nil, 0
+	}
+	pid := gs.CurrentTurn
+	totalCards := 0
+	for _, h := range gs.Hands {
+		totalCards += h.Count()
+	}
+	if totalCards > 12 {
+		return nil, 0
+	}
+	maxDepth := totalCards * 3
+	if totalCards <= 8 {
+		maxDepth = totalCards * 4
+	}
+	moves := gs.GetLegalMoves()
+	bestDelay := -1
+	var bestMove *Move
+	for _, m := range moves {
+		sim := gs.Clone()
+		sim.ApplyMove(m)
+		if sim.GameOver {
+			if sim.Winner == pid {
+				return nil, 0 // winning move: not a forced loss
+			}
+			continue
+		}
+		oppWinDepth := -1
+		nodes := 0
+		for oppID := 0; oppID < gs.NumPlayers; oppID++ {
+			if oppID == pid || sim.Finished[oppID] {
+				continue
+			}
+			d := forcedWinDepth(sim, oppID, maxDepth, &nodes, 400000)
+			if d >= 0 && (oppWinDepth < 0 || d < oppWinDepth) {
+				oppWinDepth = d
+			}
+		}
+		if oppWinDepth < 0 {
+			return nil, 0 // opponent has no forced win after this move → no forced loss
+		}
+		if oppWinDepth > bestDelay {
+			bestDelay = oppWinDepth
+			mv := m
+			bestMove = &mv
+		}
+	}
+	if bestMove == nil {
+		return nil, 0
+	}
+	return bestMove, bestDelay
+}
+
+// oppWinDepthAfterMove berekent het min. aantal tegenstander-beurten tot verlies na zet m,
+// in de context van een geforceerd verlies. Geeft -1 als niet detecteerbaar.
+func oppWinDepthAfterMove(gs *GameState, m Move) int {
+	pid := gs.CurrentTurn
+	totalCards := 0
+	for _, h := range gs.Hands {
+		totalCards += h.Count()
+	}
+	maxDepth := totalCards * 3
+	if totalCards <= 8 {
+		maxDepth = totalCards * 4
+	}
+	sim := gs.Clone()
+	sim.ApplyMove(m)
+	if sim.GameOver {
+		if sim.Winner == pid {
+			return -1
+		}
+		return 0
+	}
+	nodes := 0
+	minOpp := -1
+	for oppID := 0; oppID < gs.NumPlayers; oppID++ {
+		if oppID == pid || sim.Finished[oppID] {
+			continue
+		}
+		d := forcedWinDepth(sim, oppID, maxDepth, &nodes, 400000)
+		if d >= 0 && (minOpp < 0 || d < minOpp) {
+			minOpp = d
+		}
+	}
+	return minOpp
+}
+
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
 	if win, depth := findImmediateWin(gs, e.Config.OmniscientMode); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
@@ -3633,7 +3726,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 500, maxIters: 50000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 13")
+		PrintHeader("AZEN Engine UPDATE 14")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
@@ -4208,6 +4301,9 @@ func analyzeMode(reader *Reader, cfg settings) {
 		var bestEval MoveEval
 		var actualDetail MoveDetail
 		var bestLabel string
+		var bestDelayMove *Move
+		var maxDelay int
+		var playedForcedWinDepth int
 		if doAnalysis {
 			tracker := trackers[playerID]
 			eng := NewEngine(engConfig)
@@ -4223,8 +4319,32 @@ func analyzeMode(reader *Reader, cfg settings) {
 			}
 			if d, ok := FindMoveInEval(bestEval, move); ok {
 				actualDetail = d
+			} else if bestEval.ForcedWinDepth > 0 {
+				// Controleer of de gespeelde zet ook een gedwongen winst is
+				simCheck := gs.Clone()
+				simCheck.ApplyMove(move)
+				if simCheck.GameOver && simCheck.Winner == playerID {
+					actualDetail = MoveDetail{Move: move, WinRate: 1.0, Visits: 1}
+					playedForcedWinDepth = 1
+				} else if !simCheck.GameOver {
+					tc := 0
+					for _, h := range gs.Hands {
+						tc += h.Count()
+					}
+					nodes := 0
+					d := forcedWinDepth(simCheck, playerID, tc*4, &nodes, 500000)
+					if d >= 0 {
+						actualDetail = MoveDetail{Move: move, WinRate: 1.0, Visits: 1}
+						playedForcedWinDepth = d + 1
+					} else {
+						actualDetail = eng.AnalyzeMove(gs, tracker, move)
+					}
+				} else {
+					actualDetail = eng.AnalyzeMove(gs, tracker, move)
+				}
 			} else {
 				actualDetail = eng.AnalyzeMove(gs, tracker, move)
+				bestDelayMove, maxDelay = findForcedLoss(gs, engConfig.OmniscientMode)
 			}
 		}
 		if err := gs.ValidateMove(move); err != nil {
@@ -4268,13 +4388,24 @@ func analyzeMode(reader *Reader, cfg settings) {
 		}
 		if doAnalysis {
 			forcedWin := bestEval.ForcedWinDepth > 0
+			forcedLoss := bestDelayMove != nil
 			playedIsBest := MovesEqual(bestMove, move)
+			playedIsBestDelay := forcedLoss && MovesEqual(*bestDelayMove, move)
 			tempoOverride := !playedIsBest && move.IsPass && !bestMove.IsPass
 			var diff float64
 			emoji := "✅"
-			if !playedIsBest {
+			if forcedLoss {
+				// Kwaliteitscriterium voor verliezer = vertraging (niet win%)
+				if !playedIsBestDelay {
+					emoji = "⚠️ "
+					playedDelay := oppWinDepthAfterMove(gs, move)
+					if playedDelay >= 0 && maxDelay-playedDelay >= 2 {
+						emoji = "❌"
+					}
+				}
+			} else if !playedIsBest {
 				diff = bestEval.Score - actualDetail.WinRate
-				if forcedWin {
+				if forcedWin && playedForcedWinDepth == 0 {
 					emoji = "❌"
 				} else if diff > 0.15 {
 					emoji = "❌"
@@ -4282,12 +4413,51 @@ func analyzeMode(reader *Reader, cfg settings) {
 					emoji = "⚠️ "
 				}
 			}
-			fmt.Printf("%s Gespeeld: %s (score: %.1f%%)  [%s]\n", emoji, moveLabel, actualDetail.WinRate*100, bestEval.StatsString())
-			if forcedWin && !playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
-					bestEval.ForcedWinDepth, bestLabel)
-			} else if forcedWin && playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
+			icon := emoji
+			if playedIsBest || playedIsBestDelay {
+				icon = "📘"
+			}
+			// Kies score-weergave
+			var scoreStr string
+			switch {
+			case forcedLoss:
+				playedDelay := oppWinDepthAfterMove(gs, move)
+				if playedIsBestDelay || playedDelay == maxDelay {
+					scoreStr = fmt.Sprintf("verlies in %d zetten — beste weerstand", maxDelay)
+				} else if playedDelay >= 0 {
+					scoreStr = fmt.Sprintf("verlies in %d zetten", playedDelay)
+				} else {
+					scoreStr = "score: onbekend"
+				}
+			case forcedWin && (playedIsBest || playedForcedWinDepth > 0):
+				depth := bestEval.ForcedWinDepth
+				if playedForcedWinDepth > 0 {
+					depth = playedForcedWinDepth
+				}
+				scoreStr = fmt.Sprintf("winst in %d zetten", depth)
+			default:
+				scoreStr = fmt.Sprintf("score: %.1f%%", actualDetail.WinRate*100)
+			}
+			fmt.Printf("%s Gespeeld: %s (%s)  [%s]\n", icon, moveLabel, scoreStr, bestEval.StatsString())
+			// Sub-regels
+			if forcedLoss {
+				playedDelay := oppWinDepthAfterMove(gs, move)
+				if playedIsBestDelay {
+					fmt.Printf("   ⏳ Beste weerstand — verlies in %d beurt(en) van tegenstander\n", maxDelay)
+				} else {
+					fmt.Printf("   ⏳ Beste weerstand: %s (verlies in %d i.p.v. %d beurt(en))\n",
+						FormatMove(*bestDelayMove), maxDelay, playedDelay)
+				}
+			} else if forcedWin {
+				if playedIsBest {
+					fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
+				} else if playedForcedWinDepth > 0 {
+					fmt.Printf("   ♟️  Winst in %d zetten (snelste: %s in %d zetten)\n",
+						playedForcedWinDepth, bestLabel, bestEval.ForcedWinDepth)
+				} else {
+					fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
+						bestEval.ForcedWinDepth, bestLabel)
+				}
 			} else {
 				if tempoOverride {
 					fmt.Printf("   ⚡ Tempo-verlies: engine zou spelen — %s\n", bestLabel)
@@ -4435,6 +4605,9 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 		var bestEval MoveEval
 		var actualDetail MoveDetail
 		var bestLabel string
+		var bestDelayMove *Move
+		var maxDelay int
+		var playedForcedWinDepth int
 		if doAnalysis {
 			tracker := trackers[playerID]
 			eng := NewEngine(engConfig)
@@ -4450,8 +4623,31 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			}
 			if d, ok := FindMoveInEval(bestEval, move); ok {
 				actualDetail = d
+			} else if bestEval.ForcedWinDepth > 0 {
+				simCheck := gs.Clone()
+				simCheck.ApplyMove(move)
+				if simCheck.GameOver && simCheck.Winner == playerID {
+					actualDetail = MoveDetail{Move: move, WinRate: 1.0, Visits: 1}
+					playedForcedWinDepth = 1
+				} else if !simCheck.GameOver {
+					tc := 0
+					for _, h := range gs.Hands {
+						tc += h.Count()
+					}
+					nodes := 0
+					d := forcedWinDepth(simCheck, playerID, tc*4, &nodes, 500000)
+					if d >= 0 {
+						actualDetail = MoveDetail{Move: move, WinRate: 1.0, Visits: 1}
+						playedForcedWinDepth = d + 1
+					} else {
+						actualDetail = eng.AnalyzeMove(gs, tracker, move)
+					}
+				} else {
+					actualDetail = eng.AnalyzeMove(gs, tracker, move)
+				}
 			} else {
 				actualDetail = eng.AnalyzeMove(gs, tracker, move)
+				bestDelayMove, maxDelay = findForcedLoss(gs, engConfig.OmniscientMode)
 			}
 		}
 		if err := gs.ValidateMove(move); err != nil {
@@ -4494,14 +4690,23 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 		}
 		if doAnalysis {
 			forcedWin := bestEval.ForcedWinDepth > 0
+			forcedLoss := bestDelayMove != nil
 			playedIsBest := MovesEqual(bestMove, move)
-			// Tempo-override: engine beveelt spelen aan maar PASS gespeeld → altijd ⚠️
+			playedIsBestDelay := forcedLoss && MovesEqual(*bestDelayMove, move)
 			tempoOverride := !playedIsBest && move.IsPass && !bestMove.IsPass
 			var diff float64
 			emoji := "✅"
-			if !playedIsBest {
+			if forcedLoss {
+				if !playedIsBestDelay {
+					emoji = "⚠️ "
+					playedDelay := oppWinDepthAfterMove(gs, move)
+					if playedDelay >= 0 && maxDelay-playedDelay >= 2 {
+						emoji = "❌"
+					}
+				}
+			} else if !playedIsBest {
 				diff = bestEval.Score - actualDetail.WinRate
-				if forcedWin {
+				if forcedWin && playedForcedWinDepth == 0 {
 					emoji = "❌"
 				} else if diff > 0.15 {
 					emoji = "❌"
@@ -4509,12 +4714,49 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 					emoji = "⚠️ "
 				}
 			}
-			fmt.Printf("%s Z%d P%d: %s (score: %.1f%%)  [%s]\n", emoji, moveNum, playerID+1, moveLabel, actualDetail.WinRate*100, bestEval.StatsString())
-			if forcedWin && !playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
-					bestEval.ForcedWinDepth, bestLabel)
-			} else if forcedWin && playedIsBest {
-				fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
+			icon := emoji
+			if playedIsBest || playedIsBestDelay {
+				icon = "📘"
+			}
+			var scoreStr string
+			switch {
+			case forcedLoss:
+				playedDelay := oppWinDepthAfterMove(gs, move)
+				if playedIsBestDelay || playedDelay == maxDelay {
+					scoreStr = fmt.Sprintf("verlies in %d zetten — beste weerstand", maxDelay)
+				} else if playedDelay >= 0 {
+					scoreStr = fmt.Sprintf("verlies in %d zetten", playedDelay)
+				} else {
+					scoreStr = "score: onbekend"
+				}
+			case forcedWin && (playedIsBest || playedForcedWinDepth > 0):
+				depth := bestEval.ForcedWinDepth
+				if playedForcedWinDepth > 0 {
+					depth = playedForcedWinDepth
+				}
+				scoreStr = fmt.Sprintf("winst in %d zetten", depth)
+			default:
+				scoreStr = fmt.Sprintf("score: %.1f%%", actualDetail.WinRate*100)
+			}
+			fmt.Printf("%s Z%d P%d: %s (%s)  [%s]\n", icon, moveNum, playerID+1, moveLabel, scoreStr, bestEval.StatsString())
+			if forcedLoss {
+				playedDelay := oppWinDepthAfterMove(gs, move)
+				if playedIsBestDelay {
+					fmt.Printf("   ⏳ Beste weerstand — verlies in %d beurt(en) van tegenstander\n", maxDelay)
+				} else {
+					fmt.Printf("   ⏳ Beste weerstand: %s (verlies in %d i.p.v. %d beurt(en))\n",
+						FormatMove(*bestDelayMove), maxDelay, playedDelay)
+				}
+			} else if forcedWin {
+				if playedIsBest {
+					fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
+				} else if playedForcedWinDepth > 0 {
+					fmt.Printf("   ♟️  Winst in %d zetten (snelste: %s in %d zetten)\n",
+						playedForcedWinDepth, bestLabel, bestEval.ForcedWinDepth)
+				} else {
+					fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
+						bestEval.ForcedWinDepth, bestLabel)
+				}
 			} else {
 				if tempoOverride {
 					fmt.Printf("   ⚡ Tempo-verlies: engine zou spelen — %s\n", bestLabel)
