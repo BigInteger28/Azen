@@ -1296,6 +1296,32 @@ func (kt *KnowledgeTracker) TotalOpponentCards() int {
 	return total
 }
 
+// KnownOpponentCards geeft de kaarten terug die de tracker zeker weet dat speler playerID heeft.
+// Dit lukt wanneer er nog maar 1 actieve tegenstander over is: de pool van resterende
+// onbekende kaarten (totaal deck − mijn hand − gespeelde kaarten − dead cards) is dan
+// precies gelijk aan de hand van die tegenstander.
+// Bij 3 spelers met perfecte verdeling (0 dead cards) geldt dit zodra er 1 winnaar is.
+// Geeft nil terug als deductie niet mogelijk is.
+func (kt *KnowledgeTracker) KnownOpponentCards(playerID int) []Card {
+	if playerID == kt.MyPlayerID || kt.HandCounts[playerID] == 0 {
+		return nil
+	}
+	activeOpps := 0
+	for p, count := range kt.HandCounts {
+		if p != kt.MyPlayerID && count > 0 {
+			activeOpps++
+		}
+	}
+	if activeOpps != 1 {
+		return nil
+	}
+	possible := kt.PossibleOpponentCards()
+	if len(possible) != kt.HandCounts[playerID] {
+		return nil
+	}
+	return possible
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // ENGINE - HEURISTICS
@@ -1557,7 +1583,8 @@ func ShouldPass(gs *GameState, playerID int) bool {
 // ═══════════════════════════════════════════════════════════════
 
 type Config struct {
-	Iterations     int
+	Iterations     int           // maximum iteraties (hard stop)
+	MinIterations  int           // minimum iteraties (altijd uitvoeren, ook na deadline)
 	MaxTime        time.Duration
 	ExploreConst   float64
 	NumPlayers     int
@@ -1567,11 +1594,12 @@ type Config struct {
 
 func DefaultConfig(numPlayers int) Config {
 	return Config{
-		Iterations:   10000,
-		MaxTime:      0,
-		ExploreConst: 1.4,
-		NumPlayers:   numPlayers,
-		NumWorkers:   2,
+		Iterations:    50000,
+		MinIterations: 500,
+		MaxTime:       0,
+		ExploreConst:  1.4,
+		NumPlayers:    numPlayers,
+		NumWorkers:    2,
 	}
 }
 
@@ -1936,7 +1964,7 @@ func filterDominatedMoves(moves []Move, round RoundState) []Move {
 	return filtered
 }
 
-func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed int64, rootFiltered []Move) workerResult {
+func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, minIters int, seed int64, rootFiltered []Move) workerResult {
 	workerCfg := e.Config
 	workerCfg.NumWorkers = 1
 	worker := &Engine{Config: workerCfg, rng: rand.New(rand.NewSource(seed))}
@@ -1946,7 +1974,7 @@ func (e *Engine) runWorker(gs *GameState, kt *KnowledgeTracker, iters int, seed 
 	deadline := time.Now().Add(worker.Config.MaxTime)
 	actualIters := 0
 	for iter := 0; iter < iters; iter++ {
-		if hasDeadline && time.Now().After(deadline) {
+		if hasDeadline && time.Now().After(deadline) && actualIters >= minIters {
 			break
 		}
 		detGS := worker.determinize(gs, kt)
@@ -2181,6 +2209,10 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 	if itersPerWorker < 1 {
 		itersPerWorker = 1
 	}
+	minItersPerWorker := e.Config.MinIterations / numWorkers
+	if minItersPerWorker < 1 && e.Config.MinIterations > 0 {
+		minItersPerWorker = 1
+	}
 	seeds := make([]int64, numWorkers)
 	for i := range seeds {
 		seeds[i] = e.rng.Int63()
@@ -2196,7 +2228,7 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 			if idx == numWorkers-1 {
 				iters = e.Config.Iterations - itersPerWorker*(numWorkers-1)
 			}
-			results[idx] = e.runWorker(gs, kt, iters, seeds[idx], rootFiltered)
+			results[idx] = e.runWorker(gs, kt, iters, minItersPerWorker, seeds[idx], rootFiltered)
 		}(w)
 	}
 	wg.Wait()
@@ -2286,7 +2318,7 @@ func (e *Engine) bestMoveSingle(gs *GameState, kt *KnowledgeTracker, rootFiltere
 	singleStart := time.Now()
 	actualIters := 0
 	for iter := 0; iter < e.Config.Iterations; iter++ {
-		if hasDeadline && time.Now().After(deadline) {
+		if hasDeadline && time.Now().After(deadline) && actualIters >= e.Config.MinIterations {
 			break
 		}
 		detGS := e.determinize(gs, kt)
@@ -3592,16 +3624,19 @@ func FormatScore(score float64) string {
 
 type settings struct {
 	numThreads int
+	minIters   int
+	maxIters   int
+	thinkMs    int
 }
 
 func main() {
 	reader := NewReader()
-	cfg := settings{numThreads: 8}
+	cfg := settings{numThreads: 8, minIters: 500, maxIters: 50000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 12")
+		PrintHeader("AZEN Engine UPDATE 13")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
-		fmt.Printf("  [0] Instellingen  (threads: %d)\n", cfg.numThreads)
+		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
 		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou")
 		fmt.Println("  [2] Analyse - Bekijk een gespeeld spel opnieuw")
 		fmt.Println("  [3] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
@@ -3633,8 +3668,8 @@ func main() {
 
 func settingsMenu(reader *Reader, cfg settings) settings {
 	PrintHeader("Instellingen")
-	fmt.Printf("Huidige threads: %d\n", cfg.numThreads)
-	fmt.Println()
+	fmt.Printf("Huidige instellingen: %d threads | min %d – max %d iter | %d ms\n\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
+
 	fmt.Println("Threads bepalen hoeveel parallelle ISMCTS-bomen tegelijk draaien.")
 	fmt.Println("Meer threads = sterkere engine binnen dezelfde denktijd.")
 	fmt.Println("  1  = sequentieel (origineel gedrag)")
@@ -3646,9 +3681,39 @@ func settingsMenu(reader *Reader, cfg settings) settings {
 			n = 64
 		}
 		cfg.numThreads = n
-		fmt.Printf("✅ Threads ingesteld op %d.\n\n", n)
+		fmt.Printf("✅ Threads: %d\n\n", n)
 	} else {
 		fmt.Printf("Ongewijzigd (%d threads).\n\n", cfg.numThreads)
+	}
+
+	fmt.Println("Iteraties bepalen de rekenkwaliteit van de engine.")
+	fmt.Println("  Minimum: engine denkt altijd minstens dit aantal iteraties (ook al is de tijd al om).")
+	fmt.Println("  Maximum: engine stopt zodra dit bereikt is, ook vóór de tijdslimiet.")
+	fmt.Println()
+	if n, err := reader.ReadInt(fmt.Sprintf("Minimum iteraties per zet (huidige: %d): ", cfg.minIters)); err == nil && n >= 1 {
+		cfg.minIters = n
+		fmt.Printf("✅ Minimum iteraties: %d\n", n)
+	} else {
+		fmt.Printf("Ongewijzigd (%d).\n", cfg.minIters)
+	}
+	if n, err := reader.ReadInt(fmt.Sprintf("Maximum iteraties per zet (huidige: %d): ", cfg.maxIters)); err == nil && n >= 1 {
+		if n < cfg.minIters {
+			n = cfg.minIters
+			fmt.Printf("⚠️  Maximum kleiner dan minimum — aangepast naar %d.\n", n)
+		}
+		cfg.maxIters = n
+		fmt.Printf("✅ Maximum iteraties: %d\n\n", n)
+	} else {
+		fmt.Printf("Ongewijzigd (%d).\n\n", cfg.maxIters)
+	}
+
+	fmt.Println("Denktijd: engine stopt na deze tijd (tenzij minimum nog niet gehaald is).")
+	fmt.Println()
+	if n, err := reader.ReadInt(fmt.Sprintf("Denktijd per zet in ms (huidige: %d): ", cfg.thinkMs)); err == nil && n > 0 {
+		cfg.thinkMs = n
+		fmt.Printf("✅ Denktijd: %d ms\n\n", n)
+	} else {
+		fmt.Printf("Ongewijzigd (%d ms).\n\n", cfg.thinkMs)
 	}
 	return cfg
 }
@@ -3758,19 +3823,26 @@ func printGameStatus(gs *GameState, tracker *KnowledgeTracker, myPlayer int) {
 			h.Sort()
 			handDisplay = h.String()
 		} else {
-			susp := tracker.Suspicions[i]
-			var parts []string
-			for _, c := range susp {
-				parts = append(parts, c.RankStr())
+			deduced := tracker.KnownOpponentCards(i)
+			if deduced != nil {
+				h := NewHand(deduced)
+				h.Sort()
+				handDisplay = h.String() + " [afgeleid]"
+			} else {
+				susp := tracker.Suspicions[i]
+				var parts []string
+				for _, c := range susp {
+					parts = append(parts, c.RankStr())
+				}
+				remaining := count - len(susp)
+				if remaining < 0 {
+					remaining = 0
+				}
+				for j := 0; j < remaining; j++ {
+					parts = append(parts, "?")
+				}
+				handDisplay = strings.Join(parts, " ")
 			}
-			remaining := count - len(susp)
-			if remaining < 0 {
-				remaining = 0
-			}
-			for j := 0; j < remaining; j++ {
-				parts = append(parts, "?")
-			}
-			handDisplay = strings.Join(parts, " ")
 		}
 
 		fmt.Printf("%sP%d [%2d kaarten]: %s\n", marker, i+1, count, handDisplay)
@@ -3843,13 +3915,10 @@ func playMode(reader *Reader, cfg settings) {
 	}
 	tracker := NewKnowledgeTracker(numPlayers, myPlayer, hands[myPlayer], deadCards)
 	gs := NewGameWithHands(hands, deadCards, 0)
-	ms := 2000
-	if n, err := reader.ReadInt("Engine denktijd per zet in ms (standaard 2000): "); err == nil && n > 0 {
-		ms = n
-	}
 	engConfig := DefaultConfig(numPlayers)
-	engConfig.Iterations = math.MaxInt32 // onbeperkt — tijdslimiet stuurt het af
-	engConfig.MaxTime = time.Duration(ms) * time.Millisecond
+	engConfig.MinIterations = cfg.minIters
+	engConfig.Iterations = cfg.maxIters
+	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
 	engConfig.NumWorkers = cfg.numThreads
 	eng := NewEngine(engConfig)
 	startStr := reader.ReadLine("Wie begint? (spelernummer of 'ik'): ")
@@ -3864,6 +3933,17 @@ func playMode(reader *Reader, cfg settings) {
 		if gs.CurrentTurn == myPlayer {
 			PrintSubHeader("Jouw beurt")
 			PrintCards(gs.Hands[myPlayer])
+			legalNow := gs.GetLegalMoves()
+			isForcedPass := len(legalNow) == 1 && legalNow[0].IsPass
+			if isForcedPass {
+				fmt.Println("\n⏩ Geen speelbare kaarten — automatisch pas.")
+				move := PassMove(myPlayer)
+				tracker.RecordPass(myPlayer, gs.Round)
+				gs.ApplyMove(move)
+				tracker.RecordMove(move)
+				fmt.Printf("✅ Pas.\n\n")
+				continue
+			}
 			fmt.Println("\n🤔 Engine denkt na...")
 			bestMove, eval := eng.BestMove(gs, tracker)
 			if eval.ForcedWinDepth > 0 {
@@ -4058,12 +4138,9 @@ func analyzeMode(reader *Reader, cfg settings) {
 	gs := NewGameWithHands(hands, deadCards, 0)
 	engConfig := DefaultConfig(numPlayers)
 	engConfig.OmniscientMode = true
-	analyseMs := 2000
-	if n, err := reader.ReadInt("Denktijd per zet in ms (standaard 2000): "); err == nil && n > 0 {
-		analyseMs = n
-	}
-	engConfig.Iterations = math.MaxInt32
-	engConfig.MaxTime = time.Duration(analyseMs) * time.Millisecond
+	engConfig.MinIterations = cfg.minIters
+	engConfig.Iterations = cfg.maxIters
+	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
 	engConfig.NumWorkers = cfg.numThreads
 	analyzeStr := reader.ReadLine(fmt.Sprintf("Welke speler(s) analyseren? (bv. '1' of '1,3', leeg = alle %d spelers): ", numPlayers))
 	analyzeAll := strings.TrimSpace(analyzeStr) == "" || strings.ToLower(strings.TrimSpace(analyzeStr)) == "alle"
@@ -4313,10 +4390,6 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 	if p, err := reader.ReadInt(fmt.Sprintf("Wie begint (spelernummer 1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
 		startPlayer = p - 1
 	}
-	quickMs := 2000
-	if n, err := reader.ReadInt("Denktijd per zet in ms (standaard 2000): "); err == nil && n > 0 {
-		quickMs = n
-	}
 	fmt.Println()
 	fmt.Printf("Voer alle zetten in als spatie-gescheiden tokens (bv: 8888 p 33 44 66 jj p 4 5 9 1/5 ...)\n")
 	movesLine := reader.ReadLine("Zetten: ")
@@ -4328,8 +4401,9 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 	gs := NewGameWithHands(hands, deadCards, startPlayer)
 	engConfig := DefaultConfig(numPlayers)
 	engConfig.OmniscientMode = true
-	engConfig.Iterations = math.MaxInt32
-	engConfig.MaxTime = time.Duration(quickMs) * time.Millisecond
+	engConfig.MinIterations = cfg.minIters
+	engConfig.Iterations = cfg.maxIters
+	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
 	engConfig.NumWorkers = cfg.numThreads
 	trackers := make([]*KnowledgeTracker, numPlayers)
 	for p := 0; p < numPlayers; p++ {
@@ -4509,11 +4583,6 @@ func simulateMode(reader *Reader, cfg settings) {
 	fmt.Println()
 	kaartKeuze := reader.ReadLine("Kies optie (1/2): ")
 
-	simMs := 2000
-	if s, err := reader.ReadInt("Denktijd per zet in ms (standaard 2000): "); err == nil && s > 0 {
-		simMs = s
-	}
-
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	var gs *GameState
 
@@ -4572,8 +4641,9 @@ func simulateMode(reader *Reader, cfg settings) {
 	engines := make([]*Engine, numPlayers)
 	for i := 0; i < numPlayers; i++ {
 		engConfig := DefaultConfig(numPlayers)
-		engConfig.Iterations = math.MaxInt32
-		engConfig.MaxTime = time.Duration(simMs) * time.Millisecond
+		engConfig.MinIterations = cfg.minIters
+		engConfig.Iterations = cfg.maxIters
+		engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
 		engConfig.NumWorkers = cfg.numThreads
 		trackers[i] = NewKnowledgeTracker(numPlayers, i, gs.Hands[i], gs.DeadCards)
 		// Overschrijf HandCounts met werkelijke startgroottes (belangrijk bij custom handen)
@@ -4588,7 +4658,14 @@ func simulateMode(reader *Reader, cfg settings) {
 		moveNum++
 		playerID := gs.CurrentTurn
 		eng := engines[playerID]
-		bestMove, eval := eng.BestMove(gs, trackers[playerID])
+		var bestMove Move
+		var eval MoveEval
+		legalSim := gs.GetLegalMoves()
+		if len(legalSim) == 1 && legalSim[0].IsPass {
+			bestMove = PassMove(playerID)
+		} else {
+			bestMove, eval = eng.BestMove(gs, trackers[playerID])
+		}
 		fmt.Printf("Zet %d | Speler %d: %s (score: %.1f%%)  [%s] | Kaarten:",
 			moveNum, playerID+1, FormatMove(bestMove), eval.Score*100, eval.StatsString())
 		for i := 0; i < numPlayers; i++ {
