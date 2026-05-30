@@ -3763,7 +3763,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 15")
+		PrintHeader("AZEN Engine UPDATE 16")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
@@ -4046,6 +4046,13 @@ func playMode(reader *Reader, cfg settings) {
 	engConfig.Iterations = cfg.maxIters
 	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
 	engConfig.NumWorkers = cfg.numThreads
+	if numPlayers > 2 {
+		pressureStr := reader.ReadLine(fmt.Sprintf("Druk op welke speler? (0 = niemand, 1-%d, niet jezelf): ", numPlayers))
+		if n, err := strconv.Atoi(strings.TrimSpace(pressureStr)); err == nil && n >= 1 && n <= numPlayers && n-1 != myPlayer {
+			engConfig.PressureTarget = n - 1
+			fmt.Printf("🎯 Druk op Speler %d — jij speelt om P%d te laten verliezen.\n", n, n)
+		}
+	}
 	eng := NewEngine(engConfig)
 	startStr := reader.ReadLine("Wie begint? (spelernummer of 'ik'): ")
 	if strings.ToLower(startStr) == "ik" || strings.ToLower(startStr) == "me" {
@@ -4484,7 +4491,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 			scoreName := "score"
 			bestPrefix := "Beste was"
 			if underPressure {
-				scoreName = "drukscore"
+				scoreName = "Score met druk"
 				bestPrefix = "Beste drukzet"
 			}
 
