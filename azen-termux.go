@@ -1590,16 +1590,18 @@ type Config struct {
 	NumPlayers     int
 	OmniscientMode bool
 	NumWorkers     int
+	PressureTarget int // -1 = geen druk; >= 0 = speler-ID die moet verliezen
 }
 
 func DefaultConfig(numPlayers int) Config {
 	return Config{
-		Iterations:    50000,
-		MinIterations: 500,
-		MaxTime:       0,
-		ExploreConst:  1.4,
-		NumPlayers:    numPlayers,
-		NumWorkers:    2,
+		Iterations:     50000,
+		MinIterations:  500,
+		MaxTime:        0,
+		ExploreConst:   1.4,
+		NumPlayers:     numPlayers,
+		NumWorkers:     2,
+		PressureTarget: -1,
 	}
 }
 
@@ -2642,10 +2644,45 @@ func (e *Engine) simulate(gs *GameState, myID int) float64 {
 		}
 		sim.ApplyMove(m)
 	}
+	var score float64
 	if sim.GameOver {
-		return positionScore(sim, myID)
+		score = positionScore(sim, myID)
+	} else {
+		score = e.evalPos(sim, myID)
 	}
-	return e.evalPos(sim, myID)
+
+	// Druk-modus: blend eigen score met "hoe slecht doet het doel het"
+	if e.Config.PressureTarget >= 0 && e.Config.PressureTarget != myID {
+		target := e.Config.PressureTarget
+		var targetScore float64
+		if sim.Finished[target] {
+			targetScore = positionScore(sim, target)
+		} else {
+			targetCount := float64(sim.Hands[target].Count())
+			minOpp := 999.0
+			for i, h := range sim.Hands {
+				if i != target && !sim.Finished[i] {
+					if float64(h.Count()) < minOpp {
+						minOpp = float64(h.Count())
+					}
+				}
+			}
+			if minOpp == 999 {
+				minOpp = 0
+			}
+			targetScore = 0.5 + (minOpp-targetCount)*0.085
+			if targetScore < 0 {
+				targetScore = 0
+			}
+			if targetScore > 1 {
+				targetScore = 1
+			}
+		}
+		// 40% eigen positie + 60% nadeel voor het doelwit
+		score = 0.4*score + 0.6*(1.0-targetScore)
+	}
+
+	return score
 }
 
 func positionScore(gs *GameState, myID int) float64 {
@@ -3724,18 +3761,17 @@ type settings struct {
 
 func main() {
 	reader := NewReader()
-	cfg := settings{numThreads: 8, minIters: 500, maxIters: 50000, thinkMs: 2000}
+	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 14")
+		PrintHeader("AZEN Engine UPDATE 15")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
 		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou")
-		fmt.Println("  [2] Analyse - Bekijk een gespeeld spel opnieuw")
+		fmt.Println("  [2] Analyse - Analyseer een gespeelde partij")
 		fmt.Println("  [3] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
-		fmt.Println("  [4] Snelle analyse - Plak een volledige partij in één keer")
 		fmt.Println()
-		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4): ")
+		modeStr := reader.ReadLine("Kies modus (0/1/2/3): ")
 		mode, _ := strconv.Atoi(modeStr)
 		switch mode {
 		case 0:
@@ -3748,9 +3784,6 @@ func main() {
 			return
 		case 3:
 			simulateMode(reader, cfg)
-			return
-		case 4:
-			quickAnalyzeMode(reader, cfg)
 			return
 		default:
 			playMode(reader, cfg)
@@ -4186,56 +4219,19 @@ func playMode(reader *Reader, cfg settings) {
 }
 
 func analyzeMode(reader *Reader, cfg settings) {
-	PrintHeader("Analyse Modus")
-	fmt.Println("Voer het volledige spel in voor analyse.")
-	fmt.Println()
+	PrintHeader("Analyse")
+	fmt.Println("Voer de partij in één keer in.")
+	fmt.Println("Zetten: spatie-gescheiden tokens die alterneren tussen spelers.")
+	fmt.Println("Aas+vervolg: schrijf als '1/5' (aas, dan 5 in dezelfde beurt).")
+	fmt.Println("Pas: p of - of pass")
+
 	numPlayers := 2
 	if n, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && n >= 2 && n <= 4 {
 		numPlayers = n
 	}
-	hands := make([]*Hand, numPlayers)
-	for i := 0; i < numPlayers; i++ {
-		cardCount := 18
-		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
-			cardCount = n
-		}
-		fmt.Printf("\nVoer de starthand van Speler %d in (%d kaarten):\n", i+1, cardCount)
-		for {
-			parsed, err := reader.ReadCards(fmt.Sprintf("Speler %d kaarten: ", i+1))
-			if err != nil {
-				fmt.Printf("Fout: %v\n", err)
-				continue
-			}
-			if len(parsed) != cardCount {
-				fmt.Printf("Verwacht %d, kreeg %d\n", cardCount, len(parsed))
-				continue
-			}
-			hands[i] = NewHand(parsed)
-			break
-		}
-	}
-	var deadCards []Card
-	if numPlayers == 2 {
-		if reader.ReadYesNo("Dode kaarten invoeren?") {
-			for {
-				parsed, err := reader.ReadCards("Dode kaarten: ")
-				if err != nil {
-					fmt.Printf("Fout: %v\n", err)
-					continue
-				}
-				deadCards = parsed
-				break
-			}
-		}
-	}
-	gs := NewGameWithHands(hands, deadCards, 0)
-	engConfig := DefaultConfig(numPlayers)
-	engConfig.OmniscientMode = true
-	engConfig.MinIterations = cfg.minIters
-	engConfig.Iterations = cfg.maxIters
-	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
-	engConfig.NumWorkers = cfg.numThreads
-	analyzeStr := reader.ReadLine(fmt.Sprintf("Welke speler(s) analyseren? (bv. '1' of '1,3', leeg = alle %d spelers): ", numPlayers))
+
+	// Welke speler(s) analyseren (kommagescheiden of leeg = alle)
+	analyzeStr := reader.ReadLine(fmt.Sprintf("Welke speler(s) analyseren? (bv. '1' of '1,3', leeg = alle %d): ", numPlayers))
 	analyzeAll := strings.TrimSpace(analyzeStr) == "" || strings.ToLower(strings.TrimSpace(analyzeStr)) == "alle"
 	analyzePlayers := map[int]bool{}
 	if !analyzeAll {
@@ -4248,337 +4244,93 @@ func analyzeMode(reader *Reader, cfg settings) {
 			analyzeAll = true
 		}
 	}
-	trackers := make([]*KnowledgeTracker, numPlayers)
-	for p := 0; p < numPlayers; p++ {
-		if analyzeAll || analyzePlayers[p] {
-			trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
-		}
-	}
-	fmt.Println("\nVoer nu elke zet van het spel in.")
-	fmt.Println("Formaat: 'speler:kaarten'  bv. '1:KK' of '2:-' (pas) of '1:11/444' (aas+vervolg)")
-	fmt.Println("Zonder spelernummer gebruikt de engine de speler aan de beurt.")
-	fmt.Println("Typ 'klaar' om te stoppen.")
-	fmt.Println()
-	moveNum := 0
-	for !gs.GameOver {
-		moveNum++
-		fmt.Printf("--- Zet %d (Speler %d aan de beurt) ---\n", moveNum, gs.CurrentTurn+1)
-		input := reader.ReadLine("Zet: ")
-		if strings.ToLower(input) == "klaar" || strings.ToLower(input) == "done" {
-			break
-		}
-		parts := strings.SplitN(input, ":", 2)
-		playerStr := strings.TrimSpace(parts[0])
-		cardsStr := ""
-		if len(parts) > 1 {
-			cardsStr = strings.TrimSpace(parts[1])
-		} else {
-			cardsStr = playerStr
-			playerStr = strconv.Itoa(gs.CurrentTurn + 1)
-		}
-		playerNum, _ := strconv.Atoi(playerStr)
-		playerID := playerNum - 1
-		if playerID < 0 {
-			playerID = gs.CurrentTurn
-		}
-		mainCardsStr, followCardsStr, hasFollowCards := strings.Cut(cardsStr, "/")
-		mainCardsStr = strings.TrimSpace(mainCardsStr)
-		mainCardsLower := strings.ToLower(mainCardsStr)
-		var move Move
-		if mainCardsLower == "pass" || mainCardsLower == "p" || mainCardsStr == "-" {
-			move = Move{PlayerID: playerID, IsPass: true}
-		} else {
-			parsed, err := ParseCards(mainCardsStr)
-			if err != nil {
-				fmt.Printf("Fout: %v\n", err)
-				moveNum--
-				continue
-			}
-			move = Move{PlayerID: playerID, Cards: parsed}
-		}
-		doAnalysis := analyzeAll || analyzePlayers[playerID]
-		var bestMove Move
-		var bestEval MoveEval
-		var actualDetail MoveDetail
-		var bestLabel string
-		var bestDelayMove *Move
-		var maxDelay int
-		var playedForcedWinDepth int
-		if doAnalysis {
-			tracker := trackers[playerID]
-			eng := NewEngine(engConfig)
-			bestMove, bestEval = eng.BestMove(gs, tracker)
-			bestLabel = FormatMove(bestMove)
-			if bestMove.ContainsReset() {
-				gsClone := gs.Clone()
-				gsClone.ApplyMove(bestMove)
-				if !gsClone.GameOver && gsClone.CurrentTurn == playerID {
-					bestFollow, _ := eng.BestMove(gsClone, tracker)
-					bestLabel = fmt.Sprintf("%s / %s", FormatMove(bestMove), FormatMove(bestFollow))
-				}
-			}
-			if d, ok := FindMoveInEval(bestEval, move); ok {
-				actualDetail = d
-			} else if bestEval.ForcedWinDepth > 0 {
-				// Controleer of de gespeelde zet ook een gedwongen winst is
-				simCheck := gs.Clone()
-				simCheck.ApplyMove(move)
-				if simCheck.GameOver && simCheck.Winner == playerID {
-					actualDetail = MoveDetail{Move: move, WinRate: 1.0, Visits: 1}
-					playedForcedWinDepth = 1
-				} else if !simCheck.GameOver {
-					tc := 0
-					for _, h := range gs.Hands {
-						tc += h.Count()
-					}
-					nodes := 0
-					d := forcedWinDepth(simCheck, playerID, tc*4, &nodes, 500000)
-					if d >= 0 {
-						actualDetail = MoveDetail{Move: move, WinRate: 1.0, Visits: 1}
-						playedForcedWinDepth = d + 1
-					} else {
-						actualDetail = eng.AnalyzeMove(gs, tracker, move)
-					}
-				} else {
-					actualDetail = eng.AnalyzeMove(gs, tracker, move)
-				}
-			} else {
-				actualDetail = eng.AnalyzeMove(gs, tracker, move)
-				bestDelayMove, maxDelay = findForcedLoss(gs, engConfig.OmniscientMode)
-			}
-		}
-		if err := gs.ValidateMove(move); err != nil {
-			fmt.Printf("Ongeldige zet: %v\n", err)
-			moveNum--
-			continue
-		}
-		if move.IsPass {
-			for p := 0; p < numPlayers; p++ {
-				if trackers[p] != nil {
-					trackers[p].RecordPass(move.PlayerID, gs.Round)
-				}
-			}
-		}
-		gs.ApplyMove(move)
-		for p := 0; p < numPlayers; p++ {
-			if trackers[p] != nil {
-				trackers[p].RecordMove(move)
-			}
-		}
-		moveLabel := FormatMove(move)
-		if hasFollowCards && !gs.GameOver && gs.CurrentTurn == playerID {
-			followCardsStr = strings.TrimSpace(followCardsStr)
-			parsed, err := ParseCards(followCardsStr)
-			if err != nil {
-				fmt.Printf("⚠️  Fout in vervolg-zet: %v\n", err)
-			} else {
-				followMove := Move{PlayerID: playerID, Cards: parsed}
-				if err2 := gs.ValidateMove(followMove); err2 != nil {
-					fmt.Printf("⚠️  Ongeldige vervolg-zet: %v\n", err2)
-				} else {
-					gs.ApplyMove(followMove)
-					for p := 0; p < numPlayers; p++ {
-						if trackers[p] != nil {
-							trackers[p].RecordMove(followMove)
-						}
-					}
-					moveLabel = fmt.Sprintf("%s / %s", FormatMove(move), FormatMove(followMove))
-				}
-			}
-		}
-		if doAnalysis {
-			forcedWin := bestEval.ForcedWinDepth > 0
-			forcedLoss := bestDelayMove != nil
-			playedIsBest := MovesEqual(bestMove, move)
-			playedIsBestDelay := forcedLoss && MovesEqual(*bestDelayMove, move)
-			tempoOverride := !playedIsBest && move.IsPass && !bestMove.IsPass
-			var diff float64
-			emoji := "✅"
-			if forcedLoss {
-				// Kwaliteitscriterium voor verliezer = vertraging (niet win%)
-				if !playedIsBestDelay {
-					emoji = "⚠️ "
-					playedDelay := oppWinDepthAfterMove(gs, move)
-					if playedDelay >= 0 && maxDelay-playedDelay >= 2 {
-						emoji = "❌"
-					}
-				}
-			} else if !playedIsBest {
-				diff = bestEval.Score - actualDetail.WinRate
-				if forcedWin && playedForcedWinDepth == 0 {
-					emoji = "❌"
-				} else if diff > 0.15 {
-					emoji = "❌"
-				} else if diff > 0.02 || tempoOverride {
-					emoji = "⚠️ "
-				}
-			}
-			icon := emoji
-			if playedIsBest || playedIsBestDelay {
-				icon = "📘"
-			}
-			// Kies score-weergave
-			var scoreStr string
-			switch {
-			case forcedLoss:
-				playedDelay := oppWinDepthAfterMove(gs, move)
-				if playedIsBestDelay || playedDelay == maxDelay {
-					scoreStr = fmt.Sprintf("verlies in %d zetten — beste weerstand", maxDelay)
-				} else if playedDelay >= 0 {
-					scoreStr = fmt.Sprintf("verlies in %d zetten", playedDelay)
-				} else {
-					scoreStr = "score: onbekend"
-				}
-			case forcedWin && (playedIsBest || playedForcedWinDepth > 0):
-				depth := bestEval.ForcedWinDepth
-				if playedForcedWinDepth > 0 {
-					depth = playedForcedWinDepth
-				}
-				scoreStr = fmt.Sprintf("winst in %d zetten", depth)
-			default:
-				scoreStr = fmt.Sprintf("score: %.1f%%", actualDetail.WinRate*100)
-			}
-			fmt.Printf("%s Gespeeld: %s (%s)  [%s]\n", icon, moveLabel, scoreStr, bestEval.StatsString())
-			// Sub-regels
-			if forcedLoss {
-				playedDelay := oppWinDepthAfterMove(gs, move)
-				if playedIsBestDelay {
-					fmt.Printf("   ⏳ Beste weerstand — verlies in %d beurt(en) van tegenstander\n", maxDelay)
-				} else {
-					fmt.Printf("   ⏳ Beste weerstand: %s (verlies in %d i.p.v. %d beurt(en))\n",
-						FormatMove(*bestDelayMove), maxDelay, playedDelay)
-				}
-			} else if forcedWin {
-				if playedIsBest {
-					fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en)!\n", bestEval.ForcedWinDepth)
-				} else if playedForcedWinDepth > 0 {
-					fmt.Printf("   ♟️  Winst in %d zetten (snelste: %s in %d zetten)\n",
-						playedForcedWinDepth, bestLabel, bestEval.ForcedWinDepth)
-				} else {
-					fmt.Printf("   ♟️  Gedwongen winst in %d beurt(en) gemist! Beste was: %s\n",
-						bestEval.ForcedWinDepth, bestLabel)
-				}
-			} else {
-				if tempoOverride {
-					fmt.Printf("   ⚡ Tempo-verlies: engine zou spelen — %s\n", bestLabel)
-				} else {
-					showBest := !playedIsBest &&
-						(diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
-					if showBest {
-						fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
-							bestLabel, bestEval.Score*100, diff*100)
-					}
-				}
-			}
-			// Diagnostiek: toon top alternatieven (gesorteerd op score, max 5)
-			if len(bestEval.Details) > 1 {
-				sorted := make([]MoveDetail, len(bestEval.Details))
-				copy(sorted, bestEval.Details)
-				for i := 0; i < len(sorted); i++ {
-					for j := i + 1; j < len(sorted); j++ {
-						if sorted[j].WinRate > sorted[i].WinRate {
-							sorted[i], sorted[j] = sorted[j], sorted[i]
-						}
-					}
-				}
-				fmt.Printf("   Top: ")
-				limit := len(sorted)
-				if limit > 5 {
-					limit = 5
-				}
-				for k := 0; k < limit; k++ {
-					d := sorted[k]
-					label := FormatMove(d.Move)
-					marker := ""
-					if MovesEqual(d.Move, move) {
-						marker = "←"
-					}
-					if k > 0 {
-						fmt.Printf(" | ")
-					}
-					fmt.Printf("%s %.1f%%%s", label, d.WinRate*100, marker)
-				}
-				fmt.Println()
-			}
-		} else {
-			fmt.Printf("⏭️  Speler %d: %s\n", playerID+1, moveLabel)
-		}
-		if !gs.GameOver && gs.Finished[playerID] && gs.Hands[playerID].IsEmpty() {
-			rank := gs.PlayerRank(playerID)
-			medals := []string{"🥇", "🥈", "🥉"}
-			m := ""
-			if rank >= 0 && rank < len(medals) {
-				m = medals[rank]
-			}
-			fmt.Printf("%s Speler %d eindigt op plaats %d!\n", m, playerID+1, rank+1)
-		}
-		fmt.Println()
-	}
-	if gs.GameOver {
-		fmt.Println()
-		printRanking(gs)
-	}
-	fmt.Println("\nAnalyse klaar.")
-}
 
-func quickAnalyzeMode(reader *Reader, cfg settings) {
-	PrintHeader("Snelle Analyse")
-	fmt.Println("Voer de partij in één keer in.")
-	fmt.Println("Zetten: spatie-gescheiden tokens die alterneren tussen spelers.")
-	fmt.Println("Aas+vervolg: schrijf als '1/5' (aas, dan 5 in dezelfde beurt).")
-	fmt.Println("Pas: p of - of pass")
-	numPlayers := 2
-	if n, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && n >= 2 && n <= 4 {
-		numPlayers = n
-	}
-	analyzePlayer := 0
-	if p, err := reader.ReadInt(fmt.Sprintf("Welke speler analyseren (1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
-		analyzePlayer = p - 1
-	}
-	hands := make([]*Hand, numPlayers)
+	// Startkaarten per speler (alleen aantallen)
+	cardsPerPlayer := make([]int, numPlayers)
 	for i := 0; i < numPlayers; i++ {
-		cardCount := 18
-		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
-			cardCount = n
-		}
-		for {
-			parsed, err := reader.ReadCards(fmt.Sprintf("Speler %d kaarten (%d): ", i+1, cardCount))
-			if err != nil {
-				fmt.Printf("Fout: %v\n", err)
-				continue
-			}
-			if len(parsed) != cardCount {
-				fmt.Printf("Verwacht %d, kreeg %d\n", cardCount, len(parsed))
-				continue
-			}
-			hands[i] = NewHand(parsed)
-			break
+		cardsPerPlayer[i] = 18
+		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
+			cardsPerPlayer[i] = n
 		}
 	}
-	var deadCards []Card
+
 	startPlayer := 0
 	if p, err := reader.ReadInt(fmt.Sprintf("Wie begint (spelernummer 1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
 		startPlayer = p - 1
 	}
+
+	// Druk-doelwit
+	pressureTarget := -1
+	pressureStr := reader.ReadLine(fmt.Sprintf("Druk op welke speler? (0 = niemand, 1-%d): ", numPlayers))
+	if n, err := strconv.Atoi(strings.TrimSpace(pressureStr)); err == nil && n >= 1 && n <= numPlayers {
+		pressureTarget = n - 1
+	}
+
 	fmt.Println()
 	fmt.Printf("Voer alle zetten in als spatie-gescheiden tokens (bv: 8888 p 33 44 66 jj p 4 5 9 1/5 ...)\n")
+	fmt.Printf("Voeg de resterende kaarten van de verliezer toe als laatste token (bv: ... 9 45678).\n")
 	movesLine := reader.ReadLine("Zetten: ")
 	tokens := strings.Fields(movesLine)
 	if len(tokens) == 0 {
 		fmt.Println("Geen zetten ingevoerd.")
 		return
 	}
+
+	// Reconstrueer starthanden vanuit de zetten
+	hands, deadCards, _, reconErr := reconstructStartingHands(numPlayers, cardsPerPlayer, startPlayer, tokens)
+	if reconErr != nil {
+		fmt.Printf("Fout bij reconstructie: %v\n", reconErr)
+		return
+	}
+
+	// Ontbrekende resterende kaarten opvragen
+	for p, h := range hands {
+		if h.Count() < cardsPerPlayer[p] {
+			need := cardsPerPlayer[p] - h.Count()
+			fmt.Printf("\nSpeler %d heeft nog %d resterende kaarten die niet in de zetten stonden.\n", p+1, need)
+			for {
+				parsed, err2 := reader.ReadCards(fmt.Sprintf("Resterende kaarten Speler %d (%d kaarten): ", p+1, need))
+				if err2 != nil {
+					fmt.Printf("Fout: %v\n", err2)
+					continue
+				}
+				if len(parsed) != need {
+					fmt.Printf("Verwacht %d, kreeg %d\n", need, len(parsed))
+					continue
+				}
+				hands[p] = NewHand(append(hands[p].Cards, parsed...))
+				for _, c := range parsed {
+					for i, dc := range deadCards {
+						if dc == c {
+							deadCards = append(deadCards[:i], deadCards[i+1:]...)
+							break
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
 	gs := NewGameWithHands(hands, deadCards, startPlayer)
-	engConfig := DefaultConfig(numPlayers)
-	engConfig.OmniscientMode = true
-	engConfig.MinIterations = cfg.minIters
-	engConfig.Iterations = cfg.maxIters
-	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
-	engConfig.NumWorkers = cfg.numThreads
+
+	if pressureTarget >= 0 {
+		fmt.Printf("\n🎯 Druk op Speler %d — anderen spelen samenwerkend om P%d te laten verliezen.\n",
+			pressureTarget+1, pressureTarget+1)
+	}
+
+	baseEngConfig := DefaultConfig(numPlayers)
+	baseEngConfig.OmniscientMode = true
+	baseEngConfig.MinIterations = cfg.minIters
+	baseEngConfig.Iterations = cfg.maxIters
+	baseEngConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
+	baseEngConfig.NumWorkers = cfg.numThreads
+
 	trackers := make([]*KnowledgeTracker, numPlayers)
 	for p := 0; p < numPlayers; p++ {
 		trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
 	}
+
 	fmt.Println()
 	moveNum := 0
 	ti := 0
@@ -4600,7 +4352,16 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			}
 			move = Move{PlayerID: playerID, Cards: parsed}
 		}
-		doAnalysis := playerID == analyzePlayer
+
+		doAnalysis := analyzeAll || analyzePlayers[playerID]
+
+		// Engine config met druk-instelling voor deze speler
+		engConfig := baseEngConfig
+		underPressure := pressureTarget >= 0 && playerID != pressureTarget
+		if underPressure {
+			engConfig.PressureTarget = pressureTarget
+		}
+
 		var bestMove Move
 		var bestEval MoveEval
 		var actualDetail MoveDetail
@@ -4647,7 +4408,7 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 				}
 			} else {
 				actualDetail = eng.AnalyzeMove(gs, tracker, move)
-				bestDelayMove, maxDelay = findForcedLoss(gs, engConfig.OmniscientMode)
+				bestDelayMove, maxDelay = findForcedLoss(gs, baseEngConfig.OmniscientMode)
 			}
 		}
 		if err := gs.ValidateMove(move); err != nil {
@@ -4718,6 +4479,15 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 			if playedIsBest || playedIsBestDelay {
 				icon = "📘"
 			}
+
+			// Labelnamen afhankelijk van druk-modus
+			scoreName := "score"
+			bestPrefix := "Beste was"
+			if underPressure {
+				scoreName = "drukscore"
+				bestPrefix = "Beste drukzet"
+			}
+
 			var scoreStr string
 			switch {
 			case forcedLoss:
@@ -4727,7 +4497,7 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 				} else if playedDelay >= 0 {
 					scoreStr = fmt.Sprintf("verlies in %d zetten", playedDelay)
 				} else {
-					scoreStr = "score: onbekend"
+					scoreStr = scoreName + ": onbekend"
 				}
 			case forcedWin && (playedIsBest || playedForcedWinDepth > 0):
 				depth := bestEval.ForcedWinDepth
@@ -4736,7 +4506,7 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 				}
 				scoreStr = fmt.Sprintf("winst in %d zetten", depth)
 			default:
-				scoreStr = fmt.Sprintf("score: %.1f%%", actualDetail.WinRate*100)
+				scoreStr = fmt.Sprintf("%s: %.1f%%", scoreName, actualDetail.WinRate*100)
 			}
 			fmt.Printf("%s Z%d P%d: %s (%s)  [%s]\n", icon, moveNum, playerID+1, moveLabel, scoreStr, bestEval.StatsString())
 			if forcedLoss {
@@ -4763,12 +4533,11 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 				} else {
 					showBest := !playedIsBest && (diff > 0.02 || (bestEval.Score > 0.90 && diff > 0.005))
 					if showBest {
-						fmt.Printf("   Beste was: %s (score: %.1f%%, verschil: %.1f%%)\n",
-							bestLabel, bestEval.Score*100, diff*100)
+						fmt.Printf("   %s: %s (%s: %.1f%%, verschil: %.1f%%)\n",
+							bestPrefix, bestLabel, scoreName, bestEval.Score*100, diff*100)
 					}
 				}
 			}
-			// Diagnostiek: toon top alternatieven (gesorteerd op score, max 5)
 			if len(bestEval.Details) > 1 {
 				sorted := make([]MoveDetail, len(bestEval.Details))
 				copy(sorted, bestEval.Details)
@@ -4808,8 +4577,262 @@ func quickAnalyzeMode(reader *Reader, cfg settings) {
 	} else {
 		fmt.Printf("Partij gestopt na %d zetten (spel nog niet voorbij).\n", moveNum)
 	}
-	fmt.Println("\nSnelle analyse klaar.")
+	fmt.Println("\nAnalyse klaar.")
 }
+
+// ─── gameSim: lichtgewicht turn-simulator voor hand-reconstructie ────────────
+
+type gameSim struct {
+	numPlayers   int
+	finished     []bool
+	cardCount    []int
+	roundIsOpen  bool
+	roundCount   int
+	tableRank    Rank
+	lastPlayerID int
+	consecPasses int
+	currentTurn  int
+	GameOver     bool
+	ranking      []int
+}
+
+func newGameSim(numPlayers int, cardsPerPlayer []int, startPlayer int) *gameSim {
+	s := &gameSim{
+		numPlayers:   numPlayers,
+		finished:     make([]bool, numPlayers),
+		cardCount:    make([]int, numPlayers),
+		roundIsOpen:  true,
+		lastPlayerID: startPlayer,
+		currentTurn:  startPlayer,
+	}
+	for i, n := range cardsPerPlayer {
+		s.cardCount[i] = n
+	}
+	return s
+}
+
+func (s *gameSim) activeCount() int {
+	c := 0
+	for _, f := range s.finished {
+		if !f {
+			c++
+		}
+	}
+	return c
+}
+
+func (s *gameSim) nextActive(from int) int {
+	for i := 1; i <= s.numPlayers; i++ {
+		next := (from + i) % s.numPlayers
+		if !s.finished[next] {
+			return next
+		}
+	}
+	return from
+}
+
+func (s *gameSim) passThreshold() int {
+	active := s.activeCount()
+	if s.finished[s.lastPlayerID] {
+		return active
+	}
+	return active - 1
+}
+
+func (s *gameSim) applyPass() {
+	s.consecPasses++
+	if s.consecPasses >= s.passThreshold() {
+		lastPID := s.lastPlayerID
+		s.roundIsOpen = true
+		s.roundCount = 0
+		s.tableRank = 0
+		s.consecPasses = 0
+		if s.finished[lastPID] {
+			s.currentTurn = s.nextActive(lastPID)
+		} else {
+			s.currentTurn = lastPID
+		}
+	} else {
+		s.currentTurn = s.nextActive(s.currentTurn)
+	}
+}
+
+// applyPlay verwerkt een zet en geeft true als het spel nu voorbij is.
+func (s *gameSim) applyPlay(m Move) bool {
+	pid := m.PlayerID
+	n := len(m.Cards)
+	s.cardCount[pid] -= n
+	if s.cardCount[pid] < 0 {
+		s.cardCount[pid] = 0
+	}
+
+	if s.cardCount[pid] == 0 {
+		s.finished[pid] = true
+		s.ranking = append(s.ranking, pid)
+		if s.activeCount() <= 1 {
+			for i, f := range s.finished {
+				if !f {
+					s.ranking = append(s.ranking, i)
+					s.finished[i] = true
+					break
+				}
+			}
+			s.GameOver = true
+			return true
+		}
+		if m.ContainsReset() {
+			s.roundIsOpen = true
+			s.roundCount = 0
+			s.tableRank = 0
+			s.consecPasses = 0
+			s.lastPlayerID = pid
+			s.currentTurn = s.nextActive(pid)
+		} else {
+			s.tableRank = m.EffectiveRank(s.tableRank)
+			s.roundIsOpen = false
+			s.roundCount = n
+			s.consecPasses = 0
+			s.lastPlayerID = pid
+			s.currentTurn = s.nextActive(pid)
+		}
+		return false
+	}
+
+	if m.ContainsReset() {
+		s.roundIsOpen = true
+		s.roundCount = 0
+		s.tableRank = 0
+		s.consecPasses = 0
+		s.lastPlayerID = pid
+		s.currentTurn = pid // speler speelt opnieuw na reset
+		return false
+	}
+
+	effectRank := m.EffectiveRank(s.tableRank)
+	if s.roundIsOpen {
+		s.roundIsOpen = false
+		s.roundCount = n
+		s.tableRank = effectRank
+		s.lastPlayerID = pid
+		s.consecPasses = 0
+	} else {
+		s.tableRank = effectRank
+		s.lastPlayerID = pid
+		s.consecPasses = 0
+	}
+	s.currentTurn = s.nextActive(pid)
+	return false
+}
+
+// reconstructStartingHands bouwt starthanden op vanuit de zetten-reeks.
+// tokens mag als laatste token de resterende kaarten van de verliezer bevatten.
+// Geeft handen, dode kaarten, en het aantal verbruikte tokens terug.
+func reconstructStartingHands(numPlayers int, cardsPerPlayer []int, startPlayer int, tokens []string) (
+	[]*Hand, []Card, int, error,
+) {
+	sim := newGameSim(numPlayers, cardsPerPlayer, startPlayer)
+	playedCards := make([][]Card, numPlayers)
+	gameEndTI := len(tokens)
+
+	for ti := 0; ti < len(tokens) && !sim.GameOver; ti++ {
+		token := tokens[ti]
+		mainStr, followStr, hasFollow := strings.Cut(token, "/")
+		mainLower := strings.ToLower(strings.TrimSpace(mainStr))
+		currentPlayer := sim.currentTurn
+
+		if mainLower == "p" || mainLower == "pass" || mainLower == "-" {
+			sim.applyPass()
+		} else {
+			parsed, err := ParseCards(mainStr)
+			if err != nil {
+				return nil, nil, ti, fmt.Errorf("token %d (%q): %v", ti+1, token, err)
+			}
+			move := Move{PlayerID: currentPlayer, Cards: parsed}
+			over := sim.applyPlay(move)
+			playedCards[currentPlayer] = append(playedCards[currentPlayer], parsed...)
+			if over {
+				gameEndTI = ti + 1
+				break
+			}
+			// Follow-zet na reset (speler speelt opnieuw)
+			if hasFollow && !sim.GameOver && sim.currentTurn == currentPlayer {
+				followParsed, err2 := ParseCards(strings.TrimSpace(followStr))
+				if err2 == nil {
+					followMove := Move{PlayerID: currentPlayer, Cards: followParsed}
+					over2 := sim.applyPlay(followMove)
+					playedCards[currentPlayer] = append(playedCards[currentPlayer], followParsed...)
+					if over2 {
+						gameEndTI = ti + 1
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Verliezer = laatste in de ranking
+	loserID := -1
+	if len(sim.ranking) == numPlayers {
+		loserID = sim.ranking[len(sim.ranking)-1]
+	} else if len(sim.ranking) > 0 {
+		// Spel niet volledig afgelopen: zoek speler met kaarten over
+		for p, f := range sim.finished {
+			if !f {
+				loserID = p
+				break
+			}
+		}
+	}
+
+	// Controleer of het volgende token de resterende kaarten van de verliezer zijn
+	var remainderCards []Card
+	if gameEndTI < len(tokens) {
+		if parsed, err2 := ParseCards(tokens[gameEndTI]); err2 == nil && len(parsed) > 0 {
+			remainderCards = parsed
+			gameEndTI++
+		}
+	}
+
+	// Bouw starthanden
+	hands := make([]*Hand, numPlayers)
+	for p := 0; p < numPlayers; p++ {
+		startCards := make([]Card, len(playedCards[p]))
+		copy(startCards, playedCards[p])
+		if p == loserID {
+			startCards = append(startCards, remainderCards...)
+		}
+		hands[p] = NewHand(startCards)
+	}
+
+	// Dode kaarten = volledig deck minus alle starthanden
+	numDecks := 1
+	if numPlayers == 4 {
+		numDecks = 2
+	}
+	var allDeckCards []Card
+	if numDecks == 1 {
+		allDeckCards = NewDeck().Cards
+	} else {
+		allDeckCards = NewMultiDeck(2).Cards
+	}
+	used := make(map[Card]int)
+	for _, h := range hands {
+		for _, c := range h.Cards {
+			used[c]++
+		}
+	}
+	var deadCards []Card
+	for _, c := range allDeckCards {
+		if used[c] > 0 {
+			used[c]--
+		} else {
+			deadCards = append(deadCards, c)
+		}
+	}
+
+	return hands, deadCards, gameEndTI, nil
+}
+
 
 func simulateMode(reader *Reader, cfg settings) {
 	PrintHeader("Simulatie Modus")
