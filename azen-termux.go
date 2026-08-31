@@ -1083,7 +1083,7 @@ func (kt *KnowledgeTracker) RecordMove(m Move) {
 	if m.PlayerID == kt.MyPlayerID {
 		kt.MyHand.Remove(m.Cards)
 	}
-	kt.updateSuspicions(m.Cards)
+	kt.updateSuspicions(m.Cards, m.PlayerID)
 }
 
 func (kt *KnowledgeTracker) RecordPass(passerID int, round RoundState) {
@@ -1211,34 +1211,77 @@ func (kt *KnowledgeTracker) ExcludedRanks(playerID int) map[Rank]bool {
 	return excluded
 }
 
-func (kt *KnowledgeTracker) updateSuspicions(played []Card) {
-	playedCount := map[Rank]int{}
+func (kt *KnowledgeTracker) updateSuspicions(played []Card, playerID int) {
+	newlyPlayed := map[Rank]int{}
 	for _, c := range played {
-		playedCount[c.Rank]++
+		newlyPlayed[c.Rank]++
 	}
-	for pid, suspected := range kt.Suspicions {
-		if len(suspected) == 0 {
-			continue
+
+	// Step 1: The player who played these cards definitely used them — reduce their suspicion
+	// by exactly the cards played (they may still have more copies of the same rank).
+	if playerID != kt.MyPlayerID {
+		for rank, n := range newlyPlayed {
+			toRemove := n
+			var newSusp []Card
+			for _, c := range kt.Suspicions[playerID] {
+				if c.Rank == rank && toRemove > 0 {
+					toRemove--
+				} else {
+					newSusp = append(newSusp, c)
+				}
+			}
+			kt.Suspicions[playerID] = newSusp
 		}
-		removed := map[Rank]int{}
-		var newSusp []Card
-		for _, c := range suspected {
-			if removed[c.Rank] < playedCount[c.Rank] {
-				removed[c.Rank]++
-			} else {
-				newSusp = append(newSusp, c)
+	}
+
+	// Step 2: Pool check — trim any remaining suspicion (across all opponents) only when the
+	// available pool for a rank is truly exhausted. CardsPlayed was already updated in
+	// RecordMove before this call, so PossibleOpponentCards() reflects the current state.
+	pool := kt.PossibleOpponentCards()
+	poolCount := map[Rank]int{}
+	for _, c := range pool {
+		poolCount[c.Rank]++
+	}
+
+	for rank := range newlyPlayed {
+		totalSusp := 0
+		for _, suspected := range kt.Suspicions {
+			for _, c := range suspected {
+				if c.Rank == rank {
+					totalSusp++
+				}
 			}
 		}
-		kt.Suspicions[pid] = newSusp
+		for totalSusp > poolCount[rank] {
+			removed := false
+			for pid := range kt.Suspicions {
+				for i, c := range kt.Suspicions[pid] {
+					if c.Rank == rank {
+						kt.Suspicions[pid] = append(kt.Suspicions[pid][:i], kt.Suspicions[pid][i+1:]...)
+						totalSusp--
+						removed = true
+						break
+					}
+				}
+				if removed {
+					break
+				}
+			}
+			if !removed {
+				break
+			}
+		}
 	}
+
+	// Step 3: Exclusions — reduce counts for ranks that were played.
 	for pid, exclMap := range kt.Exclusions {
 		if exclMap == nil {
 			continue
 		}
 		for rank, count := range exclMap {
-			played := playedCount[rank]
-			if played > 0 && count > 0 {
-				newCount := count - played
+			n := newlyPlayed[rank]
+			if n > 0 && count > 0 {
+				newCount := count - n
 				if newCount <= 0 {
 					delete(exclMap, rank)
 				} else {
@@ -1297,29 +1340,68 @@ func (kt *KnowledgeTracker) TotalOpponentCards() int {
 }
 
 // KnownOpponentCards geeft de kaarten terug die de tracker zeker weet dat speler playerID heeft.
-// Dit lukt wanneer er nog maar 1 actieve tegenstander over is: de pool van resterende
-// onbekende kaarten (totaal deck − mijn hand − gespeelde kaarten − dead cards) is dan
-// precies gelijk aan de hand van die tegenstander.
-// Bij 3 spelers met perfecte verdeling (0 dead cards) geldt dit zodra er 1 winnaar is.
+// Drie gevallen:
+//  1. Gok volledig: de gebruiker heeft alle kaarten van playerID ingevoerd via gok.
+//  2. Eliminatie (1 actieve tegenstander): pool = precies hun hand.
+//  3. Deductie: alle andere actieve tegenstanders hebben volledig bekende handen (gok) →
+//     pool minus die handen = hand van playerID.
 // Geeft nil terug als deductie niet mogelijk is.
 func (kt *KnowledgeTracker) KnownOpponentCards(playerID int) []Card {
 	if playerID == kt.MyPlayerID || kt.HandCounts[playerID] == 0 {
 		return nil
 	}
-	activeOpps := 0
+
+	// Geval 1: alle kaarten van playerID zijn ingevoerd via gok.
+	if len(kt.Suspicions[playerID]) == kt.HandCounts[playerID] {
+		return kt.Suspicions[playerID]
+	}
+
+	// Geval 2 & 3: trek bekende handen van alle andere actieve tegenstanders af van de pool.
+	// Als er geen andere actieve tegenstanders zijn (geval 2), geldt pool = hand van playerID.
+	pool := kt.PossibleOpponentCards()
+	remaining := map[Rank]int{}
+	for _, c := range pool {
+		remaining[c.Rank]++
+	}
 	for p, count := range kt.HandCounts {
-		if p != kt.MyPlayerID && count > 0 {
-			activeOpps++
+		if p == kt.MyPlayerID || p == playerID || count == 0 {
+			continue
+		}
+		// p moet volledig bekend zijn via gok, anders kan je playerID niet afleiden.
+		if len(kt.Suspicions[p]) != count {
+			return nil
+		}
+		for _, c := range kt.Suspicions[p] {
+			remaining[c.Rank]--
+			if remaining[c.Rank] < 0 {
+				return nil // inconsistentie in gok-invoer
+			}
 		}
 	}
-	if activeOpps != 1 {
+	var deduced []Card
+	for _, r := range append(NormalRanks(), RankTwo, RankJoker) {
+		for i := 0; i < remaining[r]; i++ {
+			deduced = append(deduced, Card{Rank: r})
+		}
+	}
+	if len(deduced) != kt.HandCounts[playerID] {
 		return nil
 	}
-	possible := kt.PossibleOpponentCards()
-	if len(possible) != kt.HandCounts[playerID] {
-		return nil
+	return deduced
+}
+
+// AllOpponentHandsKnown geeft true als alle actieve tegenstanders volledig bekend zijn
+// (via gok of door deductie). Dit maakt exacte schaakmat-detectie mogelijk in speelmodus.
+func (kt *KnowledgeTracker) AllOpponentHandsKnown() bool {
+	for p, count := range kt.HandCounts {
+		if p == kt.MyPlayerID || count == 0 {
+			continue
+		}
+		if kt.KnownOpponentCards(p) == nil {
+			return false
+		}
 	}
-	return possible
+	return true
 }
 
 
@@ -1695,13 +1777,21 @@ func findImmediateWin(gs *GameState, knownHands bool) (*Move, int) {
 	for _, h := range gs.Hands {
 		totalCards += h.Count()
 	}
-	if totalCards > 12 {
+	// Zodra iemand gewonnen heeft zijn alle overblijvende handen exact bekend (in OmniscientMode).
+	// Dan kan de schaakmat-zoektocht altijd uitgevoerd worden, ongeacht het kaartaantal.
+	// Zonder winnaar: harde grens van 12 kaarten om exponentiële blowup te voorkomen.
+	someoneFinished := knownHands && gs.Winner != -1
+	if !someoneFinished && totalCards > 12 {
 		return nil, 0
 	}
 	// Adaptieve diepte: bij meer kaarten minder diep zoeken (bredere boom)
 	maxDepth := totalCards * 3
 	if totalCards <= 8 {
 		maxDepth = totalCards * 4
+	}
+	nodeLimit := 500000
+	if knownHands {
+		nodeLimit = 2000000
 	}
 	nodes := 0
 
@@ -1714,11 +1804,11 @@ func findImmediateWin(gs *GameState, knownHands bool) (*Move, int) {
 		}
 		sim := gs.Clone()
 		sim.ApplyMove(m)
-		if sim.GameOver && sim.Winner == pid {
+		if notLastPlace(sim, pid) {
 			mv := m
 			return &mv, 1
 		}
-		d := forcedWinDepth(sim, pid, maxDepth-1, &nodes, 500000)
+		d := forcedWinDepth(sim, pid, maxDepth-1, &nodes, nodeLimit)
 		if d >= 0 {
 			myMoves := d + 1 // +1 voor deze zet
 			if bestMove == nil || myMoves < bestDepth {
@@ -1734,6 +1824,17 @@ func findImmediateWin(gs *GameState, knownHands bool) (*Move, int) {
 	return nil, 0
 }
 
+// notLastPlace retourneert true als het spel voorbij is en myID NIET als laatste geëindigd is.
+// Dit is de correcte win-definitie in meerspelersspellen: de verliezer is de laatste speler,
+// iedereen daarvoor "wint" (ook 2e of 3e plaats). gs.Winner alleen geeft de 1e-plaatswinnaar.
+func notLastPlace(gs *GameState, myID int) bool {
+	if !gs.GameOver {
+		return false
+	}
+	rank := gs.PlayerRank(myID)
+	return rank >= 0 && rank < gs.NumPlayers-1
+}
+
 // forcedWinDepth bepaalt via minimax het aantal eigen beurten tot gedwongen
 // winst. Retourneert -1 als geen forced win, of ≥0 (het aantal resterende
 // eigen beurten). Bij onze beurt telt elke zet als +1. Bij tegenstander telt
@@ -1744,7 +1845,7 @@ func forcedWinDepth(gs *GameState, myID int, depth int, nodes *int, maxNodes int
 		return -1
 	}
 	if gs.GameOver {
-		if gs.Winner == myID {
+		if notLastPlace(gs, myID) {
 			return 0
 		}
 		return -1
@@ -2202,12 +2303,17 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 	for _, h := range gs.Hands {
 		totalCards += h.Count()
 	}
-	if totalCards > 12 {
+	someoneFinished := knownHands && gs.Winner != -1
+	if !someoneFinished && totalCards > 12 {
 		return nil, 0
 	}
 	maxDepth := totalCards * 3
 	if totalCards <= 8 {
 		maxDepth = totalCards * 4
+	}
+	nodeLimit := 400000
+	if knownHands {
+		nodeLimit = 2000000
 	}
 	moves := gs.GetLegalMoves()
 	bestDelay := -1
@@ -2216,7 +2322,7 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 		sim := gs.Clone()
 		sim.ApplyMove(m)
 		if sim.GameOver {
-			if sim.Winner == pid {
+			if notLastPlace(sim, pid) {
 				return nil, 0 // winning move: not a forced loss
 			}
 			continue
@@ -2227,7 +2333,7 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 			if oppID == pid || sim.Finished[oppID] {
 				continue
 			}
-			d := forcedWinDepth(sim, oppID, maxDepth, &nodes, 400000)
+			d := forcedWinDepth(sim, oppID, maxDepth, &nodes, nodeLimit)
 			if d >= 0 && (oppWinDepth < 0 || d < oppWinDepth) {
 				oppWinDepth = d
 			}
@@ -2262,10 +2368,10 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 	sim := gs.Clone()
 	sim.ApplyMove(m)
 	if sim.GameOver {
-		if sim.Winner == pid {
-			return -1
+		if notLastPlace(sim, pid) {
+			return -1 // pid is niet laatste = pid wint = tegenstander wint niet
 		}
-		return 0
+		return 0 // pid is laatste = tegenstander wint in 0 beurten
 	}
 	nodes := 0
 	minOpp := -1
@@ -2273,7 +2379,7 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 		if oppID == pid || sim.Finished[oppID] {
 			continue
 		}
-		d := forcedWinDepth(sim, oppID, maxDepth, &nodes, 400000)
+		d := forcedWinDepth(sim, oppID, maxDepth, &nodes, 2000000)
 		if d >= 0 && (minOpp < 0 || d < minOpp) {
 			minOpp = d
 		}
@@ -2282,16 +2388,27 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 }
 
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
-	if win, depth := findImmediateWin(gs, e.Config.OmniscientMode); win != nil {
+	// Als alle handen exact bekend zijn (OmniscientMode of gok volledig), gebruik een
+	// deterministische toestand voor schaakmat-detectie — MCTS gebruikt gs + determinize zoals normaal.
+	knownHands := e.Config.OmniscientMode
+	searchGS := gs
+	if !knownHands && kt != nil && kt.AllOpponentHandsKnown() {
+		if det := e.determinize(gs, kt); det != nil {
+			searchGS = det
+			knownHands = true
+		}
+	}
+
+	if win, depth := findImmediateWin(searchGS, knownHands); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
-	if forced := findForcedHighResponse(gs); forced != nil {
+	if forced := findForcedHighResponse(searchGS); forced != nil {
 		return *forced, MoveEval{Score: 1.0, Visits: 1}
 	}
-	if win, depth := findForcedWinVsOneCard(gs); win != nil {
+	if win, depth := findForcedWinVsOneCard(searchGS); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
-	if win, depth := findForcedWinVsOneCardResponse(gs); win != nil {
+	if win, depth := findForcedWinVsOneCardResponse(searchGS); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
 	}
 	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
@@ -3763,7 +3880,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 16")
+		PrintHeader("AZEN Engine UPDATE 17")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
@@ -3912,12 +4029,27 @@ func handleGok(input string, tracker *KnowledgeTracker, myPlayer int, numPlayers
 			playerNum, CardsToString(parsed), added)
 		return true, msg
 	}
+	// Als de gebruiker het volledige aantal kaarten invoert in één gok, verwijder eerst
+	// automatische aannames (bijv. initiële wildcard-prior) om dubbelingen te voorkomen.
+	// Zo klopt len(Suspicions) == HandCounts en werkt KnownOpponentCards correct.
+	handCount := tracker.HandCounts[targetID]
+	if handCount > 0 && len(parsed) >= handCount {
+		tracker.ClearSuspicions(targetID)
+	}
 	added := tracker.AddSuspicion(targetID, parsed)
 	susp := tracker.Suspicions[targetID]
-	msg := fmt.Sprintf("🔍 Gok Speler %d heeft: %s  (%d kaart(en) toegevoegd, totaal vermoeden: %s)",
-		playerNum, CardsToString(parsed), added, CardsToString(susp))
+	volledig := len(susp) == handCount
+	volledigLabel := ""
+	if volledig {
+		volledigLabel = " ✅ volledig"
+	}
+	msg := fmt.Sprintf("🔍 Gok Speler %d heeft: %s  (%d kaart(en) toegevoegd%s, totaal vermoeden: %s)",
+		playerNum, CardsToString(parsed), added, volledigLabel, CardsToString(susp))
 	if added < len(parsed) {
 		msg += fmt.Sprintf("\n   ⚠️  %d kaart(en) niet toegevoegd: al gespeeld of niet meer in pool", len(parsed)-added)
+	}
+	if volledig {
+		msg += fmt.Sprintf("\n   🔍 Hand volledig bekend — kaarten van andere speler(s) worden afgeleid")
 	}
 	return true, msg
 }
@@ -3953,7 +4085,11 @@ func printGameStatus(gs *GameState, tracker *KnowledgeTracker, myPlayer int) {
 			if deduced != nil {
 				h := NewHand(deduced)
 				h.Sort()
-				handDisplay = h.String() + " [afgeleid]"
+				label := "[afgeleid]"
+				if len(tracker.Suspicions[i]) == count {
+					label = "[gok volledig]"
+				}
+				handDisplay = h.String() + " " + label
 			} else {
 				susp := tracker.Suspicions[i]
 				var parts []string
