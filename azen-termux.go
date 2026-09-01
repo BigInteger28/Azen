@@ -5059,11 +5059,10 @@ func perfectMode(reader *Reader, cfg settings) {
 			fmt.Println("\n🤔 Perfecte zet berekenen...")
 			pm, desc := perfMove()
 			fmt.Printf("💡 Perfect: %s   (%s)\n\n", FormatMove(pm), desc)
-			mv, quit := readSeatMove(reader, gs, myPlayer, true)
-			if quit {
+			if readAndApplySeatMove(reader, gs, trackers, myPlayer, myPlayer,
+				fmt.Sprintf("Perfect: %s (%s)", FormatMove(pm), desc)) {
 				return
 			}
-			applyRec(gs, trackers, mv)
 			continue
 		}
 
@@ -5080,11 +5079,9 @@ func perfectMode(reader *Reader, cfg settings) {
 			applyRec(gs, trackers, pm)
 			continue
 		}
-		mv, quit := readSeatMove(reader, gs, turn, false)
-		if quit {
+		if readAndApplySeatMove(reader, gs, trackers, turn, myPlayer, "") {
 			return
 		}
-		applyRec(gs, trackers, mv)
 	}
 	PrintHeader("Spel Voorbij!")
 	printRanking(gs)
@@ -5107,30 +5104,47 @@ func applyRec(gs *GameState, trackers []*KnowledgeTracker, m Move) {
 	}
 }
 
-// readSeatMove leest een zet voor een bepaalde stoel. Retourneert (zet, quit).
-func readSeatMove(reader *Reader, gs *GameState, seat int, isMe bool) (Move, bool) {
-	prompt := fmt.Sprintf("Zet van Speler %d (of '-' pas, 'quit'): ", seat+1)
-	if isMe {
-		prompt = "Jouw zet (of '-' pas, 'moves', 'quit'): "
+// readAndApplySeatMove leest en past een zet toe voor stoel `seat`, met dezelfde
+// invoer als speelmodus: 'p'/'-'/'pass', 'moves', 'status', 'hand', 'help',
+// 'hint'/'rethink', 'quit', en de vervolg-syntax "3330/44" (reset + vervolgzet).
+// Retourneert true als de gebruiker wil stoppen.
+func readAndApplySeatMove(reader *Reader, gs *GameState, trackers []*KnowledgeTracker, seat, myPlayer int, suggestion string) bool {
+	prompt := fmt.Sprintf("Zet van Speler %d (of '-' pas, 'moves', 'status', 'quit'): ", seat+1)
+	if seat == myPlayer {
+		prompt = "Jouw zet (of '-' pas, 'hint', 'moves', 'status', 'quit'): "
 	}
 	for !reader.eof {
 		input := strings.TrimSpace(reader.ReadLine(prompt))
-		lower := strings.ToLower(input)
-		switch lower {
+		switch strings.ToLower(input) {
 		case "quit", "exit":
-			return Move{}, true
+			return true
 		case "help":
 			PrintHelp()
 			continue
 		case "moves":
 			PrintMoveOptions(gs.GetLegalMoves(), 25)
 			continue
+		case "status":
+			printGameStatus(gs, trackers[myPlayer], myPlayer)
+			continue
+		case "hand":
+			PrintCards(gs.Hands[seat])
+			continue
+		case "hint", "rethink":
+			if suggestion != "" {
+				fmt.Printf("💡 %s\n", suggestion)
+			}
+			continue
 		}
+
+		mainStr, followStr, hasFollow := strings.Cut(input, "/")
+		mainStr = strings.TrimSpace(mainStr)
 		var move Move
-		if lower == "pass" || lower == "p" || lower == "-" {
+		switch strings.ToLower(mainStr) {
+		case "pass", "p", "-":
 			move = PassMove(seat)
-		} else {
-			parsed, err := ParseCards(input)
+		default:
+			parsed, err := ParseCards(mainStr)
 			if err != nil {
 				fmt.Printf("Fout: %v\n", err)
 				continue
@@ -5141,9 +5155,32 @@ func readSeatMove(reader *Reader, gs *GameState, seat int, isMe bool) (Move, boo
 			fmt.Printf("Ongeldige zet: %v\n", err)
 			continue
 		}
-		return move, false
+		applyRec(gs, trackers, move)
+
+		if hasFollow {
+			fs := strings.TrimSpace(followStr)
+			if gs.GameOver || gs.CurrentTurn != seat {
+				fmt.Printf("✅ Gespeeld: %s\n⚠️  Vervolg-zet %q genegeerd (geen reset of niet meer jouw beurt).\n\n", FormatMove(move), fs)
+				return false
+			}
+			parsed, err := ParseCards(fs)
+			if err != nil {
+				fmt.Printf("✅ Gespeeld: %s\n⚠️  Vervolg-zet %q fout: %v\n\n", FormatMove(move), fs, err)
+				return false
+			}
+			fm := Move{PlayerID: seat, Cards: parsed}
+			if err := gs.ValidateMove(fm); err != nil {
+				fmt.Printf("✅ Gespeeld: %s\n⚠️  Vervolg-zet ongeldig: %v\n\n", FormatMove(move), err)
+				return false
+			}
+			applyRec(gs, trackers, fm)
+			fmt.Printf("✅ Gespeeld: %s / %s\n\n", FormatMove(move), FormatMove(fm))
+		} else {
+			fmt.Printf("✅ Gespeeld: %s\n\n", FormatMove(move))
+		}
+		return false
 	}
-	return Move{}, true // EOF
+	return true // EOF
 }
 
 func analyzeMode(reader *Reader, cfg settings) {
