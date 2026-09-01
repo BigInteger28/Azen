@@ -2421,12 +2421,13 @@ func findForcedWinEndgame2P(gs *GameState, kt *KnowledgeTracker) (*Move, int) {
 	return nil, 0
 }
 
-// findForcedLoss detecteert of de huidige speler in een gedwongen verlies-positie zit
-// en vindt diens beste vertragingszet (de zet die het verlies het langste uitstelt).
-// Enkel van toepassing bij bekende handen (omniscient mode); tot 14 totale kaarten
-// (12 zonder bekende handen), of onbeperkt zodra iemand geëindigd is.
-// Retourneert (bestDelayMove, maxDelay) waarbij maxDelay = max. tegenstander-beurten
-// tot verlies na de beste vertragingszet. Geeft (nil, 0) terug als niet van toepassing.
+// findForcedLoss detecteert of de huidige speler in een gedwongen verlies-positie
+// zit en vindt diens beste vertragingszet. Retourneert (bestDelayMove, N):
+//   N >= 1 : verlies in N zetten (exact, kleine eindspelen)
+//   N == -1: verlies zeker (schaakmat), exacte afstand niet berekend
+//   (nil, 0): geen gedwongen verlies / niet van toepassing.
+// Bij 2 spelers + bekende handen wordt het verdict exact bepaald met een
+// transpositietabel-negamax — die lost de hele resterende partij op.
 func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 	if !knownHands || gs.GameOver {
 		return nil, 0
@@ -2437,19 +2438,60 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 		totalCards += h.Count()
 	}
 
-	// 2 spelers + bekende handen: exacte oplossing met transpositietabel.
-	// Werkt tot ~36 kaarten (de hele resterende partij), dus veel eerder dan de
-	// gewone minimax. De tabel wordt over de analyse hergebruikt.
+	// ── 2 spelers + bekende handen: exact verdict + afstand via TT-negamax ───
 	if gs.NumPlayers == 2 && totalCards <= 40 {
-		tt := analyzeSolveTT
-		if tt == nil {
-			tt = make(map[uint64]sfEntry, 1<<20)
+		bitTT, distTT := solveBitTT, solveDistTT
+		if bitTT == nil {
+			bitTT = make(map[uint64]int8, 1<<20)
 		}
-		if mv, dist, solved := solveForcedLoss2P(gs, tt, solveNodeBudget); solved {
-			return mv, dist // mv == nil ⇒ opgelost, geen gedwongen verlies
+		if distTT == nil {
+			distTT = make(map[uint64]int32, 1<<20)
 		}
+		nodes := 0
+		if v, ok := ttBit(gs, bitTT, &nodes, solveNodeBudget); ok {
+			if v == 1 {
+				return nil, 0 // zeker géén gedwongen verlies
+			}
+			// Gedwongen verlies bevestigd. De exacte afstand-boom heeft geen
+			// cutoff aan de verliezende kant en is daardoor veel duurder dan het
+			// verdict; alleen proberen als de stelling klein genoeg is.
+			var anyLoss *Move
+			for _, m := range gs.GetLegalMoves() {
+				anyLoss = &Move{PlayerID: m.PlayerID, Cards: m.Cards, IsPass: m.IsPass}
+				break
+			}
+			if totalCards > 26 {
+				return anyLoss, -1 // schaakmat zeker, afstand te duur
+			}
+			bestDelay := -1
+			var bestMove *Move
+			dn := 0
+			for _, m := range gs.GetLegalMoves() {
+				mv := &Move{PlayerID: m.PlayerID, Cards: m.Cards, IsPass: m.IsPass}
+				sim := gs.Clone()
+				sim.ApplyMove(m)
+				d := 1
+				if !sim.GameOver {
+					dd, ok := ttDistExact(sim, bitTT, distTT, &dn, solveDistBudget)
+					if !ok {
+						bestMove, bestDelay = nil, -1
+						break
+					}
+					d = dd + 1
+				}
+				if d > bestDelay {
+					bestDelay, bestMove = d, mv
+				}
+			}
+			if bestMove != nil {
+				return bestMove, bestDelay // exacte totale afstand bekend
+			}
+			return anyLoss, -1 // schaakmat zeker, afstand niet berekend (budget)
+		}
+		// verdict onopgelost → val terug op de oude minimax hieronder
 	}
 
+	// ── Oude weg: forcedWinDepth-minimax (3-4 spelers of onopgelost 2p) ──────
 	someoneFinished := knownHands && gs.Winner != -1
 	cardLimit := 12
 	if knownHands {
@@ -2466,15 +2508,14 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 	if knownHands {
 		nodeLimit = 2000000
 	}
-	moves := gs.GetLegalMoves()
 	bestDelay := -1
 	var bestMove *Move
-	for _, m := range moves {
+	for _, m := range gs.GetLegalMoves() {
 		sim := gs.Clone()
 		sim.ApplyMove(m)
 		if sim.GameOver {
 			if notLastPlace(sim, pid) {
-				return nil, 0 // winning move: not a forced loss
+				return nil, 0
 			}
 			continue
 		}
@@ -2490,7 +2531,7 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 			}
 		}
 		if oppWinDepth < 0 {
-			return nil, 0 // opponent has no forced win after this move → no forced loss
+			return nil, 0
 		}
 		if oppWinDepth > bestDelay {
 			bestDelay = oppWinDepth
@@ -2513,10 +2554,10 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 		totalCards += h.Count()
 	}
 
-	// 2 spelers + analyse-tabel: gebruik dezelfde exacte oplosser als
+	// 2 spelers + gedeelde tabellen: gebruik dezelfde exacte oplosser als
 	// findForcedLoss, zodat de "verlies in X i.p.v. Y" vergelijking klopt.
-	if analyzeSolveTT != nil && gs.NumPlayers == 2 && totalCards <= 40 {
-		return distAfterMove2P(gs, m, analyzeSolveTT, solveNodeBudget)
+	if solveBitTT != nil && gs.NumPlayers == 2 && totalCards <= 40 {
+		return distAfterMove2P(gs, m, solveBitTT, solveDistTT)
 	}
 
 	maxDepth := totalCards * 3
@@ -2551,16 +2592,16 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 // transpositietabel lost die typisch in enkele miljoenen knopen op — ook vanaf
 // het begin van een deel van 36 kaarten — waar de gewone minimax vastloopt.
 
-type sfEntry struct {
-	win  bool // speler-aan-zet eindigt NIET laatste
-	dist int  // aantal zetten (incl. passen) tot einde bij optimaal spel
-}
+const solveNodeBudget = 12_000_000
+const solveDistBudget = 120_000_000
 
-const solveNodeBudget = 15_000_000
-
-// analyzeSolveTT wordt door analyzeMode gezet zodat de tabel over de hele partij
-// hergebruikt wordt (elke latere stelling is een substelling → cache-hit).
-var analyzeSolveTT map[uint64]sfEntry
+// Gedeelde transpositietabellen voor de exacte 2-speler oplossing, gezet door
+// analyzeMode en perfectMode. solveBitTT: verdict (1 = speler-aan-zet eindigt
+// niet-laatste, 0 = verliest). solveDistTT: totaal aantal zetten tot einde bij
+// optimaal spel. Beide worden over de hele sessie hergebruikt (substellingen →
+// cache-hit), dus na de eerste oplossing zijn alle latere stellingen gratis.
+var solveBitTT map[uint64]int8
+var solveDistTT map[uint64]int32
 
 func stateKey(gs *GameState) uint64 {
 	var h uint64 = 1469598103934665603
@@ -2586,105 +2627,116 @@ func stateKey(gs *GameState) uint64 {
 	return h
 }
 
-// ttSolve2P geeft (win, dist, ok) voor de speler die in gs aan zet is.
-// win = die speler eindigt niet-laatste bij optimaal spel van beide kanten.
-// dist = zetten tot einde: de winnende kant minimaliseert, de verliezende
-// maximaliseert (langst mogelijke weerstand). ok = false als het budget op is.
-func ttSolve2P(gs *GameState, tt map[uint64]sfEntry, nodes *int, maxNodes int) (bool, int, bool) {
+// childOutcome bepaalt het verdict (1 = wint, 0 = verliest) voor speler `pid`
+// nadat zet m is toegepast op gs, plus of het kind meteen GameOver is.
+func childOutcome(gs *GameState, pid int, sim *GameState, bitTT map[uint64]int8, nodes *int, maxNodes int) (int8, bool, bool) {
+	if sim.GameOver {
+		if notLastPlace(sim, pid) {
+			return 1, true, true
+		}
+		return 0, true, true
+	}
+	w, ok := ttBit(sim, bitTT, nodes, maxNodes)
+	if !ok {
+		return 0, false, false
+	}
+	if sim.CurrentTurn == pid {
+		return w, false, true
+	}
+	return 1 - w, false, true // 2-speler nulsom
+}
+
+// ttBit: negamax met cutoff. Snel — lost ~28 kaarten in enkele miljoenen knopen.
+// 1 = speler-aan-zet eindigt niet-laatste, 0 = verliest.
+func ttBit(gs *GameState, tt map[uint64]int8, nodes *int, maxNodes int) (int8, bool) {
 	*nodes++
 	if *nodes > maxNodes {
-		return false, 0, false
+		return 0, false
 	}
 	pid := gs.CurrentTurn
 	key := stateKey(gs)
-	if e, ok := tt[key]; ok {
-		return e.win, e.dist, true
+	if v, ok := tt[key]; ok {
+		return v, true
 	}
-	haveBest := false
-	bestWin := false
-	bestDist := 0
+	var res int8
 	for _, m := range gs.GetLegalMoves() {
 		sim := gs.Clone()
 		sim.ApplyMove(m)
-		var cw bool
-		var cd int
-		if sim.GameOver {
-			cw, cd = notLastPlace(sim, pid), 1
-		} else {
-			w, d, ok := ttSolve2P(sim, tt, nodes, maxNodes)
-			if !ok {
-				return false, 0, false
-			}
-			if sim.CurrentTurn == pid {
-				cw = w
-			} else {
-				cw = !w // 2-speler nulsom
-			}
-			cd = d + 1
+		cw, _, ok := childOutcome(gs, pid, sim, tt, nodes, maxNodes)
+		if !ok {
+			return 0, false
 		}
-		better := !haveBest
-		if haveBest {
-			switch {
-			case cw != bestWin:
-				better = cw // winst verslaat verlies
-			case cw:
-				better = cd < bestDist // winnen: sneller
-			default:
-				better = cd > bestDist // verliezen: langer overleven
-			}
-		}
-		if better {
-			haveBest, bestWin, bestDist = true, cw, cd
+		if cw == 1 {
+			res = 1
+			break // één winnende zet volstaat
 		}
 	}
-	tt[key] = sfEntry{bestWin, bestDist}
-	return bestWin, bestDist, true
+	tt[key] = res
+	return res, true
 }
 
-// solveForcedLoss2P lost het 2-speler eindspel exact op. Retourneert:
-//   - (nil, 0, true)  : opgelost, speler-aan-zet staat NIET verloren
-//   - (zet, N, true)  : opgelost, gedwongen verlies; `zet` rekt het verlies het
-//                       langst, N = totaal aantal zetten tot verlies op dat pad
-//   - (nil, 0, false) : niet opgelost binnen het budget
-func solveForcedLoss2P(gs *GameState, tt map[uint64]sfEntry, maxNodes int) (*Move, int, bool) {
-	if gs.NumPlayers != 2 || gs.GameOver {
-		return nil, 0, false
+// ttDistExact: exact totaal aantal zetten (incl. passen, beide spelers) tot
+// GameOver bij optimaal spel. De winnende kant minimaliseert, de verliezende
+// maximaliseert. Volgt alleen kinderen van het "juiste" type, wat de vertakking
+// aan de winnende kant flink inperkt. bitTT/distTT worden onderweg gevuld;
+// dankzij de gedeelde distTT kost dit maar één keer per sessie moeite.
+func ttDistExact(gs *GameState, bitTT map[uint64]int8, distTT map[uint64]int32, nodes *int, maxNodes int) (int, bool) {
+	*nodes++
+	if *nodes > maxNodes {
+		return 0, false
 	}
-	nodes := 0
-	win, _, ok := ttSolve2P(gs, tt, &nodes, maxNodes)
+	pid := gs.CurrentTurn
+	key := stateKey(gs)
+	if d, ok := distTT[key]; ok {
+		return int(d), true
+	}
+	myWin, ok := ttBit(gs, bitTT, nodes, maxNodes)
 	if !ok {
-		return nil, 0, false
+		return 0, false
 	}
-	if win {
-		return nil, 0, true
-	}
-	var best *Move
-	bestDist := -1
+	best := -1
 	for _, m := range gs.GetLegalMoves() {
 		sim := gs.Clone()
 		sim.ApplyMove(m)
-		d := 1
-		if !sim.GameOver {
-			_, cd, ok2 := ttSolve2P(sim, tt, &nodes, maxNodes)
-			if !ok2 {
-				continue
+		cw, over, ok := childOutcome(gs, pid, sim, bitTT, nodes, maxNodes)
+		if !ok {
+			return 0, false
+		}
+		if cw != myWin {
+			continue // niet-optimaal voor de mover
+		}
+		cd := 1
+		if !over {
+			dd, ok := ttDistExact(sim, bitTT, distTT, nodes, maxNodes)
+			if !ok {
+				return 0, false
 			}
-			d = cd + 1
+			cd = dd + 1
 		}
-		if d > bestDist {
-			bestDist, best = d, &Move{PlayerID: m.PlayerID, Cards: m.Cards, IsPass: m.IsPass}
+		switch {
+		case best < 0:
+			best = cd
+		case myWin == 1:
+			if cd < best {
+				best = cd
+			}
+		default:
+			if cd > best {
+				best = cd
+			}
 		}
 	}
-	if best == nil {
-		return nil, 0, true
+	if best < 0 {
+		best = 1
 	}
-	return best, bestDist, true
+	distTT[key] = int32(best)
+	return best, true
 }
 
-// distAfterMove2P geeft het aantal zetten tot verlies na zet m (kleiner = sneller
-// verloren). Geeft -1 als m juist ontsnapt (geen gedwongen verlies meer), of als
-// het budget op is.
-func distAfterMove2P(gs *GameState, m Move, tt map[uint64]sfEntry, maxNodes int) int {
+// distAfterMove2P: totaal aantal zetten tot verlies ná zet m (incl. m zelf),
+// consistent met findForcedLoss. -1 = m ontsnapt aan het verlies; -2 = verlies
+// zeker maar afstand niet berekend (budget).
+func distAfterMove2P(gs *GameState, m Move, bitTT map[uint64]int8, distTT map[uint64]int32) int {
 	pid := gs.CurrentTurn
 	sim := gs.Clone()
 	sim.ApplyMove(m)
@@ -2692,19 +2744,27 @@ func distAfterMove2P(gs *GameState, m Move, tt map[uint64]sfEntry, maxNodes int)
 		if notLastPlace(sim, pid) {
 			return -1
 		}
-		return 0
+		return 1
 	}
 	nodes := 0
-	w, d, ok := ttSolve2P(sim, tt, &nodes, maxNodes)
+	cw, _, ok := childOutcome(gs, pid, sim, bitTT, &nodes, solveNodeBudget)
 	if !ok {
-		return -1
+		return -2
 	}
-	winForPid := w
-	if sim.CurrentTurn != pid {
-		winForPid = !w
+	if cw == 1 {
+		return -1 // deze zet ontsnapt aan het verlies
 	}
-	if winForPid {
-		return -1 // deze zet ontsnapt
+	tc := 0
+	for _, h := range gs.Hands {
+		tc += h.Count()
+	}
+	if tc > 26 {
+		return -2 // afstand te duur
+	}
+	dn := 0
+	d, ok2 := ttDistExact(sim, bitTT, distTT, &dn, solveDistBudget)
+	if !ok2 {
+		return -2
 	}
 	return d + 1
 }
@@ -4252,17 +4312,18 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 19")
+		PrintHeader("AZEN Engine UPDATE 20")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
-		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou")
-		fmt.Println("  [2] Analyse - Analyseer een gespeelde partij")
-		fmt.Println("  [3] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
-		fmt.Println("  [4] Kaartenset - Rating van een hand / hand voor een rating / partij-ratings")
+		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou (verborgen tegenstander)")
+		fmt.Println("  [2] Perfect - Spelen met alle handen bekend; engine speelt perfect")
+		fmt.Println("  [3] Analyse - Analyseer een gespeelde partij")
+		fmt.Println("  [4] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
+		fmt.Println("  [5] Kaartenset - Rating van een hand / hand voor een rating / partij-ratings")
 		fmt.Println("  [q] Afsluiten")
 		fmt.Println()
-		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4, q=stop): ")
+		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4/5, q=stop): ")
 		if reader.eof {
 			return
 		}
@@ -4278,13 +4339,15 @@ func main() {
 		case 1:
 			playMode(reader, cfg)
 		case 2:
-			analyzeMode(reader, cfg)
+			perfectMode(reader, cfg)
 		case 3:
-			simulateMode(reader, cfg)
+			analyzeMode(reader, cfg)
 		case 4:
+			simulateMode(reader, cfg)
+		case 5:
 			dealFinderMode(reader, cfg)
 		default:
-			fmt.Println("Onbekende keuze — kies 0, 1, 2, 3, 4 of q.")
+			fmt.Println("Onbekende keuze — kies 0, 1, 2, 3, 4, 5 of q.")
 			continue
 		}
 		if reader.eof {
@@ -4746,6 +4809,343 @@ func playMode(reader *Reader, cfg settings) {
 	printRanking(gs)
 }
 
+// perfectMove2P kiest de perfecte zet in een volledig bekende 2-speler stelling:
+// als de speler-aan-zet wint, de snelste winst; verliest hij, de langste
+// weerstand. Retourneert (zet, beschrijving, opgelost).
+func perfectMove2P(gs *GameState) (Move, string, bool) {
+	if gs.NumPlayers != 2 || gs.GameOver {
+		return Move{}, "", false
+	}
+	pid := gs.CurrentTurn
+	if solveBitTT == nil {
+		solveBitTT = make(map[uint64]int8, 1<<20)
+	}
+	if solveDistTT == nil {
+		solveDistTT = make(map[uint64]int32, 1<<20)
+	}
+	nodes := 0
+	v, ok := ttBit(gs, solveBitTT, &nodes, solveNodeBudget)
+	if !ok {
+		return Move{}, "", false
+	}
+	totalCards := 0
+	for _, h := range gs.Hands {
+		totalCards += h.Count()
+	}
+	withDist := totalCards <= 26 // exacte afstand alleen voor kleinere stellingen
+
+	moves := gs.GetLegalMoves()
+	var best *Move
+	bestDist := -1
+	dn := 0
+	for i := range moves {
+		m := moves[i]
+		sim := gs.Clone()
+		sim.ApplyMove(m)
+		cw, over, ok2 := childOutcome(gs, pid, sim, solveBitTT, &nodes, solveNodeBudget)
+		if !ok2 || cw != v {
+			continue // alleen zetten die het verdict behouden
+		}
+		d := 1
+		if !over && withDist {
+			if dd, ok3 := ttDistExact(sim, solveBitTT, solveDistTT, &dn, solveDistBudget); ok3 {
+				d = dd + 1
+			} else {
+				d = 1 << 20 // afstand onbekend
+			}
+		} else if !over {
+			d = 1 << 20 // niet berekend
+		}
+		better := best == nil
+		if !better {
+			if v == 1 {
+				better = d < bestDist // winnen: snelst
+			} else {
+				better = d > bestDist // verliezen: langst
+			}
+		}
+		if better {
+			bestDist = d
+			mm := m
+			best = &mm
+		}
+	}
+	if best == nil {
+		if len(moves) == 0 {
+			return Move{}, "", false
+		}
+		mm := moves[0]
+		best = &mm
+	}
+	var desc string
+	known := bestDist >= 1 && bestDist < (1<<20)
+	switch {
+	case v == 1 && known:
+		desc = fmt.Sprintf("gedwongen winst in %d zetten", bestDist)
+	case v == 1:
+		desc = "gedwongen winst"
+	case known:
+		desc = fmt.Sprintf("gedwongen verlies in %d zetten (langste weerstand)", bestDist)
+	default:
+		desc = "gedwongen verlies (schaakmat)"
+	}
+	return *best, desc, true
+}
+
+// perfectMode: spelen met volledige informatie. Je voert alle handen in (bij 3
+// spelers wordt de derde afgeleid); de engine speelt/adviseert dan perfect.
+func perfectMode(reader *Reader, cfg settings) {
+	PrintHeader("Spelen met Perfectie")
+	fmt.Println("Je voert álle handen in. De engine kent dan het hele spel en speelt")
+	fmt.Println("perfect (2 spelers: bewezen optimaal via eindspel-oplosser).")
+	fmt.Println()
+
+	numPlayers := 2
+	if n, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && n >= 2 && n <= 4 {
+		numPlayers = n
+	}
+	myPlayer := 0
+	if p, err := reader.ReadInt(fmt.Sprintf("Jouw spelernummer (1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
+		myPlayer = p - 1
+	}
+	cardsPer := 18
+	if n, err := reader.ReadInt("Kaarten per speler (standaard 18): "); err == nil && n > 0 {
+		cardsPer = n
+	}
+
+	// Hoeveel handen invoeren? Bij 3 spelers (1 deck, alles gedeeld) leiden we de
+	// laatste af; anders alle handen.
+	toEnter := numPlayers
+	deduceLast := numPlayers == 3
+	if deduceLast {
+		toEnter = numPlayers - 1
+	}
+
+	hands := make([]*Hand, numPlayers)
+	readHand := func(pIdx int) *Hand {
+		for !reader.eof {
+			label := fmt.Sprintf("Kaarten Speler %d", pIdx+1)
+			if pIdx == myPlayer {
+				label += " (jij)"
+			}
+			input := reader.ReadLine(label + ": ")
+			if strings.ToLower(strings.TrimSpace(input)) == "help" {
+				PrintHelp()
+				continue
+			}
+			parsed, err := ParseCards(input)
+			if err != nil {
+				fmt.Printf("Fout: %v\n", err)
+				continue
+			}
+			if len(parsed) != cardsPer {
+				fmt.Printf("Verwacht %d kaarten, kreeg %d.\n", cardsPer, len(parsed))
+				continue
+			}
+			return NewHand(parsed)
+		}
+		return nil
+	}
+	for i := 0; i < toEnter; i++ {
+		hands[i] = readHand(i)
+		if hands[i] == nil {
+			return
+		}
+	}
+
+	// Deck bepalen en resterende / afgeleide hand.
+	var deck []Card
+	if numPlayers == 4 {
+		deck = NewMultiDeck(2).Cards
+	} else {
+		deck = NewDeck().Cards
+	}
+	rem := map[Rank]int{}
+	for _, c := range deck {
+		rem[c.Rank]++
+	}
+	for i := 0; i < toEnter; i++ {
+		for _, c := range hands[i].Cards {
+			rem[c.Rank]--
+		}
+	}
+	for _, cnt := range rem {
+		if cnt < 0 {
+			fmt.Println("⚠️  Meer exemplaren van een kaart ingevoerd dan er in het spel zijn — controleer de handen.")
+			return
+		}
+	}
+	var leftover []Card
+	for _, r := range append(NormalRanks(), RankTwo, RankJoker) {
+		for k := 0; k < rem[r]; k++ {
+			leftover = append(leftover, Card{Rank: r})
+		}
+	}
+	var deadCards []Card
+	if deduceLast {
+		if len(leftover) != cardsPer {
+			fmt.Printf("⚠️  De afgeleide hand van Speler %d zou %d kaarten hebben (verwacht %d).\n", numPlayers, len(leftover), cardsPer)
+			return
+		}
+		hands[numPlayers-1] = NewHand(leftover)
+		fmt.Printf("Afgeleide hand Speler %d: %s\n", numPlayers, hands[numPlayers-1].String())
+	} else {
+		deadCards = leftover
+		if numPlayers == 2 {
+			fmt.Printf("Niet-gedeelde kaarten (%d): %s\n", len(deadCards), NewHand(deadCards).String())
+		}
+	}
+
+	autoOpp := reader.ReadYesNo("Tegenstander(s) automatisch perfect laten spelen?")
+
+	gs := NewGameWithHands(hands, deadCards, 0)
+	engConfig := DefaultConfig(numPlayers)
+	engConfig.OmniscientMode = true
+	engConfig.MinIterations = cfg.minIters
+	engConfig.Iterations = cfg.maxIters
+	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
+	engConfig.NumWorkers = cfg.numThreads
+	eng := NewEngine(engConfig)
+	trackers := make([]*KnowledgeTracker, numPlayers)
+	for p := 0; p < numPlayers; p++ {
+		trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
+		for q := 0; q < numPlayers; q++ {
+			trackers[p].HandCounts[q] = gs.Hands[q].Count()
+		}
+	}
+	if numPlayers == 2 {
+		solveBitTT = make(map[uint64]int8, 1<<21)
+		solveDistTT = make(map[uint64]int32, 1<<21)
+		defer func() { solveBitTT, solveDistTT = nil, nil }()
+	}
+
+	startStr := reader.ReadLine("Wie begint? (spelernummer of 'ik'): ")
+	if s := strings.ToLower(strings.TrimSpace(startStr)); s == "ik" || s == "me" {
+		gs.CurrentTurn = myPlayer
+	} else if p, err := strconv.Atoi(startStr); err == nil && p >= 1 && p <= numPlayers {
+		gs.CurrentTurn = p - 1
+	}
+
+	fmt.Printf("\n🎮 Spel gestart (perfecte informatie).\n\n")
+	// bestMove voor de menselijke speler cachen zodat 'perfMove' hieronder de
+	// perfecte zet toont/gebruikt.
+	perfMove := func() (Move, string) {
+		if numPlayers == 2 {
+			if mv, desc, ok := perfectMove2P(gs); ok {
+				return mv, desc
+			}
+		}
+		bm, ev := eng.BestMove(gs, trackers[gs.CurrentTurn])
+		if ev.ForcedWinDepth > 0 {
+			return bm, fmt.Sprintf("gedwongen winst in %d beurt(en)", ev.ForcedWinDepth)
+		}
+		return bm, fmt.Sprintf("winst: %s", FormatScore(ev.Score))
+	}
+
+	for !gs.GameOver {
+		printGameStatus(gs, trackers[myPlayer], myPlayer)
+		turn := gs.CurrentTurn
+		legal := gs.GetLegalMoves()
+		forcedPass := len(legal) == 1 && legal[0].IsPass
+
+		if turn == myPlayer {
+			PrintSubHeader("Jouw beurt")
+			PrintCards(gs.Hands[myPlayer])
+			if forcedPass {
+				fmt.Println("\n⏩ Geen speelbare kaarten — automatisch pas.")
+				applyRec(gs, trackers, PassMove(myPlayer))
+				continue
+			}
+			fmt.Println("\n🤔 Perfecte zet berekenen...")
+			pm, desc := perfMove()
+			fmt.Printf("💡 Perfect: %s   (%s)\n\n", FormatMove(pm), desc)
+			mv, quit := readSeatMove(reader, gs, myPlayer, true)
+			if quit {
+				return
+			}
+			applyRec(gs, trackers, mv)
+			continue
+		}
+
+		// tegenstander
+		PrintSubHeader(fmt.Sprintf("Beurt van Speler %d", turn+1))
+		if forcedPass {
+			fmt.Println("⏩ Geen speelbare kaarten — automatisch pas.")
+			applyRec(gs, trackers, PassMove(turn))
+			continue
+		}
+		if autoOpp {
+			pm, desc := perfMove()
+			fmt.Printf("🤖 Speler %d speelt perfect: %s   (%s)\n\n", turn+1, FormatMove(pm), desc)
+			applyRec(gs, trackers, pm)
+			continue
+		}
+		mv, quit := readSeatMove(reader, gs, turn, false)
+		if quit {
+			return
+		}
+		applyRec(gs, trackers, mv)
+	}
+	PrintHeader("Spel Voorbij!")
+	printRanking(gs)
+}
+
+// applyRec past een zet toe en werkt alle trackers bij.
+func applyRec(gs *GameState, trackers []*KnowledgeTracker, m Move) {
+	if m.IsPass {
+		for _, t := range trackers {
+			if t != nil {
+				t.RecordPass(m.PlayerID, gs.Round)
+			}
+		}
+	}
+	gs.ApplyMove(m)
+	for _, t := range trackers {
+		if t != nil {
+			t.RecordMove(m)
+		}
+	}
+}
+
+// readSeatMove leest een zet voor een bepaalde stoel. Retourneert (zet, quit).
+func readSeatMove(reader *Reader, gs *GameState, seat int, isMe bool) (Move, bool) {
+	prompt := fmt.Sprintf("Zet van Speler %d (of '-' pas, 'quit'): ", seat+1)
+	if isMe {
+		prompt = "Jouw zet (of '-' pas, 'moves', 'quit'): "
+	}
+	for !reader.eof {
+		input := strings.TrimSpace(reader.ReadLine(prompt))
+		lower := strings.ToLower(input)
+		switch lower {
+		case "quit", "exit":
+			return Move{}, true
+		case "help":
+			PrintHelp()
+			continue
+		case "moves":
+			PrintMoveOptions(gs.GetLegalMoves(), 25)
+			continue
+		}
+		var move Move
+		if lower == "pass" || lower == "p" || lower == "-" {
+			move = PassMove(seat)
+		} else {
+			parsed, err := ParseCards(input)
+			if err != nil {
+				fmt.Printf("Fout: %v\n", err)
+				continue
+			}
+			move = Move{PlayerID: seat, Cards: parsed}
+		}
+		if err := gs.ValidateMove(move); err != nil {
+			fmt.Printf("Ongeldige zet: %v\n", err)
+			continue
+		}
+		return move, false
+	}
+	return Move{}, true // EOF
+}
+
 func analyzeMode(reader *Reader, cfg settings) {
 	PrintHeader("Analyse")
 	fmt.Println("Voer de partij in één keer in.")
@@ -4859,12 +5259,14 @@ func analyzeMode(reader *Reader, cfg settings) {
 		trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
 	}
 
-	// Gedeelde transpositietabel voor de exacte 2-speler eindspel-oplossing:
+	// Gedeelde transpositietabellen voor de exacte 2-speler oplossing:
 	// éénmaal opgelost, daarna zijn alle latere stellingen cache-hits.
 	if numPlayers == 2 {
-		analyzeSolveTT = make(map[uint64]sfEntry, 1<<21)
-		defer func() { analyzeSolveTT = nil }()
+		solveBitTT = make(map[uint64]int8, 1<<21)
+		solveDistTT = make(map[uint64]int32, 1<<21)
+		defer func() { solveBitTT, solveDistTT = nil, nil }()
 	}
+	firstSchaakmatMove := -1 // eerste zetnummer waar de geanalyseerde speler verloren stond
 
 	fmt.Println()
 	moveNum := 0
@@ -4994,16 +5396,23 @@ func analyzeMode(reader *Reader, cfg settings) {
 		if doAnalysis {
 			forcedWin := bestEval.ForcedWinDepth > 0
 			forcedLoss := bestDelayMove != nil
+			if forcedLoss && firstSchaakmatMove < 0 {
+				firstSchaakmatMove = moveNum
+			}
+			distKnown := forcedLoss && maxDelay >= 1 // exacte "verlies in N" beschikbaar
 			playedIsBest := MovesEqual(bestMove, move)
-			playedIsBestDelay := forcedLoss && MovesEqual(*bestDelayMove, move)
+			playedIsBestDelay := distKnown && MovesEqual(*bestDelayMove, move)
 			tempoOverride := !playedIsBest && move.IsPass && !bestMove.IsPass
+			playedDelay := -3 // -3 = niet berekend
+			if distKnown {
+				playedDelay = oppWinDepthAfterMove(preGS, move)
+			}
 			var diff float64
 			emoji := "✅"
 			if forcedLoss {
-				if !playedIsBestDelay {
+				if distKnown && !playedIsBestDelay {
 					emoji = "⚠️ "
-					playedDelay := oppWinDepthAfterMove(preGS, move)
-					if playedDelay >= 0 && maxDelay-playedDelay >= 2 {
+					if playedDelay >= 1 && maxDelay-playedDelay >= 2 {
 						emoji = "❌"
 					}
 				}
@@ -5032,14 +5441,18 @@ func analyzeMode(reader *Reader, cfg settings) {
 
 			var scoreStr string
 			switch {
+			case forcedLoss && !distKnown:
+				scoreStr = "gedwongen verlies (schaakmat)"
 			case forcedLoss:
-				playedDelay := oppWinDepthAfterMove(preGS, move)
-				if playedIsBestDelay || playedDelay == maxDelay {
+				switch {
+				case playedIsBestDelay || playedDelay == maxDelay:
 					scoreStr = fmt.Sprintf("verlies in %d zetten — beste weerstand", maxDelay)
-				} else if playedDelay >= 0 {
+				case playedDelay >= 1:
 					scoreStr = fmt.Sprintf("verlies in %d zetten", playedDelay)
-				} else {
-					scoreStr = scoreName + ": onbekend"
+				case playedDelay == 0:
+					scoreStr = "verlies (schaakmat)"
+				default:
+					scoreStr = "gedwongen verlies (schaakmat)"
 				}
 			case forcedWin && (playedIsBest || playedForcedWinDepth > 0):
 				depth := bestEval.ForcedWinDepth
@@ -5051,13 +5464,18 @@ func analyzeMode(reader *Reader, cfg settings) {
 				scoreStr = fmt.Sprintf("%s: %.1f%%", scoreName, actualDetail.WinRate*100)
 			}
 			fmt.Printf("%s Z%d P%d: %s (%s)  [%s]\n", icon, moveNum, playerID+1, moveLabel, scoreStr, bestEval.StatsString())
-			if forcedLoss {
-				playedDelay := oppWinDepthAfterMove(preGS, move)
-				if playedIsBestDelay {
-					fmt.Printf("   ⏳ Beste weerstand — verlies in %d beurt(en) van tegenstander\n", maxDelay)
-				} else {
-					fmt.Printf("   ⏳ Beste weerstand: %s (verlies in %d i.p.v. %d beurt(en))\n",
+			if forcedLoss && !distKnown {
+				fmt.Printf("   ⏳ Schaakmat — exacte weerstand niet bepaald (stelling te groot)\n")
+			} else if forcedLoss {
+				switch {
+				case playedIsBestDelay:
+					fmt.Printf("   ⏳ Beste weerstand gespeeld — verlies in %d zet(ten)\n", maxDelay)
+				case playedDelay >= 1:
+					fmt.Printf("   ⏳ Beste weerstand: %s (verlies in %d i.p.v. %d zet(ten))\n",
 						FormatMove(*bestDelayMove), maxDelay, playedDelay)
+				default:
+					fmt.Printf("   ⏳ Beste weerstand: %s (verlies in %d zet(ten))\n",
+						FormatMove(*bestDelayMove), maxDelay)
 				}
 			} else if forcedWin {
 				if playedIsBest {
@@ -5118,6 +5536,11 @@ func analyzeMode(reader *Reader, cfg settings) {
 		printRanking(gs)
 	} else {
 		fmt.Printf("Partij gestopt na %d zetten (spel nog niet voorbij).\n", moveNum)
+	}
+	if firstSchaakmatMove == 1 {
+		fmt.Println("\n⛔ De geanalyseerde speler stond al bij de verdeling verloren — geen enkele zet kon het schaakmat vermijden.")
+	} else if firstSchaakmatMove > 1 {
+		fmt.Printf("\n⛔ De geanalyseerde speler werd schaakmat gezet bij zet %d. De zet(ten) daarvóór hadden het nog kunnen voorkomen.\n", firstSchaakmatMove)
 	}
 	fmt.Println("\nAnalyse klaar.")
 }
