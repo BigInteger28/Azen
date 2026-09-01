@@ -2423,7 +2423,8 @@ func findForcedWinEndgame2P(gs *GameState, kt *KnowledgeTracker) (*Move, int) {
 
 // findForcedLoss detecteert of de huidige speler in een gedwongen verlies-positie zit
 // en vindt diens beste vertragingszet (de zet die het verlies het langste uitstelt).
-// Enkel van toepassing bij bekende handen (omniscient mode) en ≤12 totale kaarten.
+// Enkel van toepassing bij bekende handen (omniscient mode); tot 14 totale kaarten
+// (12 zonder bekende handen), of onbeperkt zodra iemand geëindigd is.
 // Retourneert (bestDelayMove, maxDelay) waarbij maxDelay = max. tegenstander-beurten
 // tot verlies na de beste vertragingszet. Geeft (nil, 0) terug als niet van toepassing.
 func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
@@ -2435,8 +2436,26 @@ func findForcedLoss(gs *GameState, knownHands bool) (*Move, int) {
 	for _, h := range gs.Hands {
 		totalCards += h.Count()
 	}
+
+	// 2 spelers + bekende handen: exacte oplossing met transpositietabel.
+	// Werkt tot ~36 kaarten (de hele resterende partij), dus veel eerder dan de
+	// gewone minimax. De tabel wordt over de analyse hergebruikt.
+	if gs.NumPlayers == 2 && totalCards <= 40 {
+		tt := analyzeSolveTT
+		if tt == nil {
+			tt = make(map[uint64]sfEntry, 1<<20)
+		}
+		if mv, dist, solved := solveForcedLoss2P(gs, tt, solveNodeBudget); solved {
+			return mv, dist // mv == nil ⇒ opgelost, geen gedwongen verlies
+		}
+	}
+
 	someoneFinished := knownHands && gs.Winner != -1
-	if !someoneFinished && totalCards > 12 {
+	cardLimit := 12
+	if knownHands {
+		cardLimit = 14
+	}
+	if !someoneFinished && totalCards > cardLimit {
 		return nil, 0
 	}
 	maxDepth := totalCards * 3
@@ -2493,6 +2512,13 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 	for _, h := range gs.Hands {
 		totalCards += h.Count()
 	}
+
+	// 2 spelers + analyse-tabel: gebruik dezelfde exacte oplosser als
+	// findForcedLoss, zodat de "verlies in X i.p.v. Y" vergelijking klopt.
+	if analyzeSolveTT != nil && gs.NumPlayers == 2 && totalCards <= 40 {
+		return distAfterMove2P(gs, m, analyzeSolveTT, solveNodeBudget)
+	}
+
 	maxDepth := totalCards * 3
 	if totalCards <= 8 {
 		maxDepth = totalCards * 4
@@ -2517,6 +2543,170 @@ func oppWinDepthAfterMove(gs *GameState, m Move) int {
 		}
 	}
 	return minOpp
+}
+
+// ── Exacte 2-speler eindspel-oplosser met transpositietabel ──────────────────
+// In analysemodus zijn alle handen bekend; dan is de rest van de partij een
+// eindige, perfecte-informatie 2-speler nulsomgame. Een negamax met
+// transpositietabel lost die typisch in enkele miljoenen knopen op — ook vanaf
+// het begin van een deel van 36 kaarten — waar de gewone minimax vastloopt.
+
+type sfEntry struct {
+	win  bool // speler-aan-zet eindigt NIET laatste
+	dist int  // aantal zetten (incl. passen) tot einde bij optimaal spel
+}
+
+const solveNodeBudget = 15_000_000
+
+// analyzeSolveTT wordt door analyzeMode gezet zodat de tabel over de hele partij
+// hergebruikt wordt (elke latere stelling is een substelling → cache-hit).
+var analyzeSolveTT map[uint64]sfEntry
+
+func stateKey(gs *GameState) uint64 {
+	var h uint64 = 1469598103934665603
+	mix := func(x uint64) { h ^= x; h *= 1099511628211 }
+	for pi, hd := range gs.Hands {
+		var cnt [17]int
+		for _, c := range hd.Cards {
+			if int(c.Rank) < 17 {
+				cnt[c.Rank]++
+			}
+		}
+		for r := 0; r < 17; r++ {
+			mix(uint64(pi)<<40 | uint64(r)<<8 | uint64(cnt[r]))
+		}
+	}
+	r := gs.Round
+	var b uint64
+	if r.IsOpen {
+		b = 1
+	}
+	mix(uint64(gs.CurrentTurn)<<48 | uint64(r.Count)<<32 | uint64(r.TableRank)<<16 |
+		uint64(r.ConsecPasses)<<8 | uint64(r.LastPlayerID)<<4 | b)
+	return h
+}
+
+// ttSolve2P geeft (win, dist, ok) voor de speler die in gs aan zet is.
+// win = die speler eindigt niet-laatste bij optimaal spel van beide kanten.
+// dist = zetten tot einde: de winnende kant minimaliseert, de verliezende
+// maximaliseert (langst mogelijke weerstand). ok = false als het budget op is.
+func ttSolve2P(gs *GameState, tt map[uint64]sfEntry, nodes *int, maxNodes int) (bool, int, bool) {
+	*nodes++
+	if *nodes > maxNodes {
+		return false, 0, false
+	}
+	pid := gs.CurrentTurn
+	key := stateKey(gs)
+	if e, ok := tt[key]; ok {
+		return e.win, e.dist, true
+	}
+	haveBest := false
+	bestWin := false
+	bestDist := 0
+	for _, m := range gs.GetLegalMoves() {
+		sim := gs.Clone()
+		sim.ApplyMove(m)
+		var cw bool
+		var cd int
+		if sim.GameOver {
+			cw, cd = notLastPlace(sim, pid), 1
+		} else {
+			w, d, ok := ttSolve2P(sim, tt, nodes, maxNodes)
+			if !ok {
+				return false, 0, false
+			}
+			if sim.CurrentTurn == pid {
+				cw = w
+			} else {
+				cw = !w // 2-speler nulsom
+			}
+			cd = d + 1
+		}
+		better := !haveBest
+		if haveBest {
+			switch {
+			case cw != bestWin:
+				better = cw // winst verslaat verlies
+			case cw:
+				better = cd < bestDist // winnen: sneller
+			default:
+				better = cd > bestDist // verliezen: langer overleven
+			}
+		}
+		if better {
+			haveBest, bestWin, bestDist = true, cw, cd
+		}
+	}
+	tt[key] = sfEntry{bestWin, bestDist}
+	return bestWin, bestDist, true
+}
+
+// solveForcedLoss2P lost het 2-speler eindspel exact op. Retourneert:
+//   - (nil, 0, true)  : opgelost, speler-aan-zet staat NIET verloren
+//   - (zet, N, true)  : opgelost, gedwongen verlies; `zet` rekt het verlies het
+//                       langst, N = totaal aantal zetten tot verlies op dat pad
+//   - (nil, 0, false) : niet opgelost binnen het budget
+func solveForcedLoss2P(gs *GameState, tt map[uint64]sfEntry, maxNodes int) (*Move, int, bool) {
+	if gs.NumPlayers != 2 || gs.GameOver {
+		return nil, 0, false
+	}
+	nodes := 0
+	win, _, ok := ttSolve2P(gs, tt, &nodes, maxNodes)
+	if !ok {
+		return nil, 0, false
+	}
+	if win {
+		return nil, 0, true
+	}
+	var best *Move
+	bestDist := -1
+	for _, m := range gs.GetLegalMoves() {
+		sim := gs.Clone()
+		sim.ApplyMove(m)
+		d := 1
+		if !sim.GameOver {
+			_, cd, ok2 := ttSolve2P(sim, tt, &nodes, maxNodes)
+			if !ok2 {
+				continue
+			}
+			d = cd + 1
+		}
+		if d > bestDist {
+			bestDist, best = d, &Move{PlayerID: m.PlayerID, Cards: m.Cards, IsPass: m.IsPass}
+		}
+	}
+	if best == nil {
+		return nil, 0, true
+	}
+	return best, bestDist, true
+}
+
+// distAfterMove2P geeft het aantal zetten tot verlies na zet m (kleiner = sneller
+// verloren). Geeft -1 als m juist ontsnapt (geen gedwongen verlies meer), of als
+// het budget op is.
+func distAfterMove2P(gs *GameState, m Move, tt map[uint64]sfEntry, maxNodes int) int {
+	pid := gs.CurrentTurn
+	sim := gs.Clone()
+	sim.ApplyMove(m)
+	if sim.GameOver {
+		if notLastPlace(sim, pid) {
+			return -1
+		}
+		return 0
+	}
+	nodes := 0
+	w, d, ok := ttSolve2P(sim, tt, &nodes, maxNodes)
+	if !ok {
+		return -1
+	}
+	winForPid := w
+	if sim.CurrentTurn != pid {
+		winForPid = !w
+	}
+	if winForPid {
+		return -1 // deze zet ontsnapt
+	}
+	return d + 1
 }
 
 func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) {
@@ -3932,6 +4122,7 @@ func parseMoveLog(line string) (Move, error) {
 
 type Reader struct {
 	scanner *bufio.Scanner
+	eof     bool
 }
 
 func NewReader() *Reader {
@@ -3943,6 +4134,7 @@ func (r *Reader) ReadLine(prompt string) string {
 	if r.scanner.Scan() {
 		return strings.TrimSpace(r.scanner.Text())
 	}
+	r.eof = true
 	return ""
 }
 
@@ -4060,32 +4252,45 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 18")
+		PrintHeader("AZEN Engine UPDATE 19")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
 		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou")
 		fmt.Println("  [2] Analyse - Analyseer een gespeelde partij")
 		fmt.Println("  [3] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
+		fmt.Println("  [4] Kaartenset - Rating van een hand / hand voor een rating / partij-ratings")
+		fmt.Println("  [q] Afsluiten")
 		fmt.Println()
-		modeStr := reader.ReadLine("Kies modus (0/1/2/3): ")
+		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4, q=stop): ")
+		if reader.eof {
+			return
+		}
+		if s := strings.ToLower(strings.TrimSpace(modeStr)); s == "q" || s == "quit" || s == "stop" || s == "exit" {
+			fmt.Println("Tot ziens!")
+			return
+		}
 		mode, _ := strconv.Atoi(modeStr)
 		switch mode {
 		case 0:
 			cfg = settingsMenu(reader, cfg)
+			continue
 		case 1:
 			playMode(reader, cfg)
-			return
 		case 2:
 			analyzeMode(reader, cfg)
-			return
 		case 3:
 			simulateMode(reader, cfg)
-			return
+		case 4:
+			dealFinderMode(reader, cfg)
 		default:
-			playMode(reader, cfg)
+			fmt.Println("Onbekende keuze — kies 0, 1, 2, 3, 4 of q.")
+			continue
+		}
+		if reader.eof {
 			return
 		}
+		reader.ReadLine("\nDruk Enter voor het hoofdmenu... ")
 	}
 }
 
@@ -4654,6 +4859,13 @@ func analyzeMode(reader *Reader, cfg settings) {
 		trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
 	}
 
+	// Gedeelde transpositietabel voor de exacte 2-speler eindspel-oplossing:
+	// éénmaal opgelost, daarna zijn alle latere stellingen cache-hits.
+	if numPlayers == 2 {
+		analyzeSolveTT = make(map[uint64]sfEntry, 1<<21)
+		defer func() { analyzeSolveTT = nil }()
+	}
+
 	fmt.Println()
 	moveNum := 0
 	ti := 0
@@ -4731,6 +4943,11 @@ func analyzeMode(reader *Reader, cfg settings) {
 				}
 			} else {
 				actualDetail = eng.AnalyzeMove(gs, tracker, move)
+			}
+			// Gedwongen-verlies detectie: draai altijd wanneer de engine geen
+			// gedwongen winst voor deze speler vond (niet alleen als de gespeelde
+			// zet buiten de MCTS-evaluatie viel).
+			if bestDelayMove == nil && bestEval.ForcedWinDepth <= 0 && playedForcedWinDepth == 0 {
 				bestDelayMove, maxDelay = findForcedLoss(gs, baseEngConfig.OmniscientMode)
 			}
 		}
@@ -4745,6 +4962,8 @@ func analyzeMode(reader *Reader, cfg settings) {
 				}
 			}
 		}
+		// Stelling vóór de zet bewaren: oppWinDepthAfterMove past de zet zelf toe.
+		preGS := gs.Clone()
 		gs.ApplyMove(move)
 		for p := 0; p < numPlayers; p++ {
 			if trackers[p] != nil {
@@ -4783,7 +5002,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 			if forcedLoss {
 				if !playedIsBestDelay {
 					emoji = "⚠️ "
-					playedDelay := oppWinDepthAfterMove(gs, move)
+					playedDelay := oppWinDepthAfterMove(preGS, move)
 					if playedDelay >= 0 && maxDelay-playedDelay >= 2 {
 						emoji = "❌"
 					}
@@ -4814,7 +5033,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 			var scoreStr string
 			switch {
 			case forcedLoss:
-				playedDelay := oppWinDepthAfterMove(gs, move)
+				playedDelay := oppWinDepthAfterMove(preGS, move)
 				if playedIsBestDelay || playedDelay == maxDelay {
 					scoreStr = fmt.Sprintf("verlies in %d zetten — beste weerstand", maxDelay)
 				} else if playedDelay >= 0 {
@@ -4833,7 +5052,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 			}
 			fmt.Printf("%s Z%d P%d: %s (%s)  [%s]\n", icon, moveNum, playerID+1, moveLabel, scoreStr, bestEval.StatsString())
 			if forcedLoss {
-				playedDelay := oppWinDepthAfterMove(gs, move)
+				playedDelay := oppWinDepthAfterMove(preGS, move)
 				if playedIsBestDelay {
 					fmt.Printf("   ⏳ Beste weerstand — verlies in %d beurt(en) van tegenstander\n", maxDelay)
 				} else {
@@ -5295,6 +5514,536 @@ func simulateMode(reader *Reader, cfg settings) {
 		PrintHeader("Spel Voorbij!")
 		printRanking(gs)
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KAARTENSET RATING  (modus 4)
+// ═══════════════════════════════════════════════════════════════
+//
+// hands.txt is een brede steekproef over het VOLLEDIGE spectrum van mogelijke
+// handen (van de zwakst denkbare tot 00221111KKKKQQQQJJ), gesorteerd op ruwe
+// score. Elke hand krijgt een percentiel p (positie in dat spectrum) en daaruit
+// een rating:
+//
+//     p <= 0,20 :  rating = 5000 * p               (lineair, 0 .. 1000)
+//     p  > 0,20 :  rating = 1000 * 2^(10*(p-0,20))
+//
+// Zo verdubbelt de rating zelf elke 0,1 percentiel boven p0,2:
+//   p0,2 -> 1000    p0,3 -> 2000    p0,4 -> 4000    p0,5 -> 8000
+//   p0,6 -> 16000   p0,7 -> 32000   p0,8 -> 64000   p0,9 -> 128000   p1,0 -> 256000
+// Een doorsnee geschud deel zit rond p0,24 -> rating ~1320.
+// Geen simulatie: puur sorteren op score en de rating toekennen. De theoretische
+// topkaart krijgt gegarandeerd rating 256000.
+//
+// De modus werkt twee kanten op: een hand invoeren en de rating opvragen, of
+// een rating opgeven en een passende hand krijgen.
+
+const handsFile = "hands.txt"
+const handsHeader = "# AZEN kaartenset -- spectrum van mogelijke handen -- <kaarten> <score> <rating>"
+const handsSampleN = 8000
+const ratingMax = 256000 // rating bij p = 1,0
+
+// handScore geeft de ruwe sterkte van een hand.
+// Per kaart: 3..J = 1..9, Q 11, K 13, aas 15, twee 17, joker 20.
+// Setbonus (hoe meer je in één zet kwijt kunt): paar +4, triple +10, quad +20.
+// Dubbele joker of dubbele twee: nog eens +6 (wildcards als paar zijn extra sterk).
+func handScore(cards []Card) int {
+	val := func(r Rank) int {
+		switch r {
+		case RankQueen:
+			return 11
+		case RankKing:
+			return 13
+		case RankAce:
+			return 15
+		case RankTwo:
+			return 17
+		case RankJoker:
+			return 20
+		default:
+			return int(r) - 2 // 3->1 ... 9->7, X->8, J->9
+		}
+	}
+	total := 0
+	rc := map[Rank]int{}
+	for _, c := range cards {
+		total += val(c.Rank)
+		rc[c.Rank]++
+	}
+	for r, n := range rc {
+		switch {
+		case n >= 4:
+			total += 20
+		case n == 3:
+			total += 10
+		case n == 2:
+			total += 4
+		}
+		if (r == RankJoker || r == RankTwo) && n >= 2 {
+			total += 6
+		}
+	}
+	return total
+}
+
+// handComposition telt joker/twee/aas/hoge kaarten en set-groepen.
+func handComposition(cards []Card) (jokers, twos, aces, high, sets int) {
+	rc := map[Rank]int{}
+	for _, c := range cards {
+		rc[c.Rank]++
+		switch c.Rank {
+		case RankJoker:
+			jokers++
+		case RankTwo:
+			twos++
+		case RankAce:
+			aces++
+		}
+		if !c.IsSpecial() && c.Rank >= RankJack {
+			high++
+		}
+	}
+	for _, n := range rc {
+		if n >= 2 {
+			sets++
+		}
+	}
+	return
+}
+
+type scoredHand struct {
+	cards []Card
+	raw   int
+}
+
+func handToTokens(cards []Card) string {
+	cp := append([]Card{}, cards...)
+	sort.Slice(cp, func(i, j int) bool { return cp[i].Rank < cp[j].Rank })
+	var sb strings.Builder
+	for _, c := range cp {
+		sb.WriteString(c.RankStr())
+	}
+	return sb.String()
+}
+
+// De vaste ijkpunten voor score 100 en 0. Best = het door de gebruiker
+// opgegeven voorbeeld (respecteert de regel dat elke speler minstens 1 twee
+// houdt, dus max 2 tweeën in eigen hand).
+func bestAnchorHand() []Card  { c, _ := ParseCards("00221111kkkkqqqqjj"); return c }
+func worstAnchorHand() []Card { c, _ := ParseCards("233334444555566667"); return c }
+
+// randomHand trekt 18 kaarten uit één volledig spel met een sterkte-bias
+// (in [-1..1]) en dwingt 1..2 tweeën af (spelregel + realisme; jokers zijn er
+// sowieso maar 2).
+func randomHand(bias float64, rng *rand.Rand) []Card {
+	weight := func(r Rank) float64 {
+		s := 0.0
+		switch r {
+		case RankJoker:
+			s = 1.0
+		case RankTwo:
+			s = 0.9
+		case RankAce:
+			s = 0.75
+		default:
+			s = (float64(r) - 8.0) / 6.0 // 3 -> -0.83 ... K -> 0.83
+		}
+		w := 1.0 + bias*s
+		if w < 0.03 {
+			w = 0.03
+		}
+		return w
+	}
+	pool := append([]Card{}, NewDeck().Cards...)
+	var hand []Card
+	for len(hand) < 18 && len(pool) > 0 {
+		tot := 0.0
+		for _, c := range pool {
+			tot += weight(c.Rank)
+		}
+		x := rng.Float64() * tot
+		idx, cum := len(pool)-1, 0.0
+		for i, c := range pool {
+			cum += weight(c.Rank)
+			if x <= cum {
+				idx = i
+				break
+			}
+		}
+		hand = append(hand, pool[idx])
+		pool = append(pool[:idx], pool[idx+1:]...)
+	}
+	countRank := func(rank Rank) int {
+		n := 0
+		for _, c := range hand {
+			if c.Rank == rank {
+				n++
+			}
+		}
+		return n
+	}
+	for countRank(RankTwo) < 1 {
+		wi, wv := -1, 999
+		for i, c := range hand {
+			if c.IsSpecial() {
+				continue
+			}
+			if v := int(c.Rank); v < wv {
+				wv, wi = v, i
+			}
+		}
+		if wi < 0 {
+			break
+		}
+		hand[wi] = Card{Rank: RankTwo}
+	}
+	for countRank(RankTwo) > 2 {
+		for i, c := range hand {
+			if c.Rank == RankTwo {
+				hand[i] = Card{Rank: RankThree}
+				break
+			}
+		}
+	}
+	return hand
+}
+
+// generatePopulation bouwt een brede steekproef die het HELE sterktespectrum
+// dekt: de twee vaste ijkpunten (zwakst / sterkst denkbaar) plus een sweep over
+// het volledige bias-bereik, met extra dichtheid aan de sterke kant zodat de
+// rating ook bovenin fijn genoeg verdeeld is. Gesorteerd op score, ontdubbeld.
+func generatePopulation(n int, rng *rand.Rand) []scoredHand {
+	seen := map[string]bool{}
+	var out []scoredHand
+	add := func(cards []Card) bool {
+		if len(cards) != 18 {
+			return false
+		}
+		tok := handToTokens(cards)
+		if seen[tok] {
+			return false
+		}
+		seen[tok] = true
+		out = append(out, scoredHand{cards: cards, raw: handScore(cards)})
+		return true
+	}
+	add(worstAnchorHand())
+	add(bestAnchorHand())
+	for i := 0; i < n; i++ {
+		frac := (float64(i) + 0.5) / float64(n)
+		bias := -3.2 + 6.4*frac + (rng.Float64()-0.5)*0.7
+		add(randomHand(bias, rng))
+	}
+	for i := 0; i < n/2; i++ {
+		add(randomHand(2.0+rng.Float64()*2.5, rng))
+	}
+	// Top van het spectrum dicht vullen: high-bias trekkingen, alleen de sterkste
+	// bijhouden (die zeer zeldzame handen zijn nodig voor een fijne rating bovenin).
+	topBest := handScore(bestAnchorHand())
+	kept := 0
+	for tries := 0; tries < n*40 && kept < n/3; tries++ {
+		h := randomHand(3.0+rng.Float64()*3.5, rng)
+		if handScore(h) >= topBest-45 && add(h) {
+			kept++
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].raw < out[j].raw })
+	return out
+}
+
+// ratingFromP zet een percentiel (0..1) om naar een rating: lineair tot p0,2
+// (rating 1000), daarna verdubbelt de rating per 0,1 percentiel.
+func ratingFromP(p float64) int {
+	if p < 0 {
+		p = 0
+	}
+	if p > 1 {
+		p = 1
+	}
+	var r float64
+	if p <= 0.2 {
+		r = 5000 * p
+	} else {
+		r = 1000 * math.Pow(2, 10*(p-0.2))
+	}
+	return int(math.Round(r))
+}
+
+// pFromRating is de inverse van ratingFromP.
+func pFromRating(r float64) float64 {
+	var p float64
+	if r <= 1000 {
+		p = r / 5000
+	} else {
+		p = 0.2 + 0.1*math.Log2(r/1000)
+	}
+	if p < 0 {
+		p = 0
+	}
+	if p > 1 {
+		p = 1
+	}
+	return p
+}
+
+type scoreBucket struct {
+	score  int
+	p      float64
+	rating int
+	hands  []scoredHand
+}
+
+// buildScoreBuckets groepeert de (op score gesorteerde) populatie per ruwe score
+// en geeft elke groep een percentiel (midden van de groep) en een rating. De
+// zwakste groep krijgt exact p=0 (rating 0), de sterkste exact p=1 (rating 256000).
+func buildScoreBuckets(hands []scoredHand) []scoreBucket {
+	n := len(hands)
+	var out []scoreBucket
+	for i := 0; i < n; {
+		j := i
+		for j < n && hands[j].raw == hands[i].raw {
+			j++
+		}
+		p := (float64(i) + 0.5*float64(j-i)) / float64(n)
+		grp := make([]scoredHand, j-i)
+		copy(grp, hands[i:j])
+		out = append(out, scoreBucket{score: hands[i].raw, p: p, rating: ratingFromP(p), hands: grp})
+		i = j
+	}
+	if len(out) > 0 {
+		out[0].p, out[0].rating = 0, 0
+		out[len(out)-1].p, out[len(out)-1].rating = 1, ratingMax
+	}
+	return out
+}
+
+// scorePercentile geeft het percentiel van een willekeurige score binnen de
+// populatie: op of boven de sterkste -> 1,0; op of onder de zwakste -> 0.
+func scorePercentile(buckets []scoreBucket, n, score int) float64 {
+	if len(buckets) == 0 {
+		return 0
+	}
+	if score >= buckets[len(buckets)-1].score {
+		return 1
+	}
+	if score <= buckets[0].score {
+		return 0
+	}
+	below, equal := 0, 0
+	for _, b := range buckets {
+		switch {
+		case b.score < score:
+			below += len(b.hands)
+		case b.score == score:
+			equal = len(b.hands)
+		}
+	}
+	return (float64(below) + 0.5*float64(equal)) / float64(n)
+}
+
+func formatHands(hands []scoredHand) string {
+	ratingOf := map[int]int{}
+	for _, b := range buildScoreBuckets(hands) {
+		ratingOf[b.score] = b.rating
+	}
+	var sb strings.Builder
+	sb.WriteString(handsHeader + "\n")
+	for _, h := range hands {
+		sb.WriteString(fmt.Sprintf("%s %d %d\n", handToTokens(h.cards), h.raw, ratingOf[h.raw]))
+	}
+	return sb.String()
+}
+
+func parseHands(data string) []scoredHand {
+	var out []scoredHand
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		cards, err := ParseCards(fields[0])
+		if err != nil || len(cards) != 18 {
+			continue
+		}
+		// Score altijd herberekenen uit de kaarten: de scorefunctie is de enige
+		// bron van waarheid, dus een oud bestand met verouderde getallen blijft werken.
+		out = append(out, scoredHand{cards: cards, raw: handScore(cards)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].raw < out[j].raw })
+	return out
+}
+
+func printHandRating(cards []Card, score int, p float64, rating int, hands []scoredHand) {
+	jok, two, ace, high, sets := handComposition(cards)
+	hh := NewHand(cards)
+	hh.Sort()
+	fmt.Println()
+	fmt.Printf("Hand     : %s\n", hh.String())
+	fmt.Printf("Tokens   : %s\n", handToTokens(cards))
+	fmt.Printf("Score    : %d   (percentiel ~%.1f%% van alle mogelijke handen)\n", score, p*100)
+	fmt.Printf("RATING   : %d\n", rating)
+	fmt.Printf("Samenst. : %d joker, %d twee, %d aas, %d hoog (J+), %d set(s)\n", jok, two, ace, high, sets)
+	fmt.Println()
+	topRef := bestAnchorHand()
+	fmt.Printf("Ref: %d handen in het spectrum, score %d (rating 0) .. %d\n",
+		len(hands), hands[0].raw, hands[len(hands)-1].raw)
+	fmt.Printf("Ref: theoretische topper %s -> score %d, rating %d\n",
+		handToTokens(topRef), handScore(topRef), ratingMax)
+}
+
+// runPartijRating reconstrueert de starthanden uit een ingevoerde partij en
+// toont per speler de rating van zijn starthand.
+func runPartijRating(reader *Reader, buckets []scoreBucket, popN int) {
+	PrintHeader("Partij -> ratings")
+	numPlayers := 2
+	if v, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && v >= 2 && v <= 4 {
+		numPlayers = v
+	}
+	startPlayer := 0
+	if v, err := reader.ReadInt(fmt.Sprintf("Wie begint (1-%d, standaard 1): ", numPlayers)); err == nil && v >= 1 && v <= numPlayers {
+		startPlayer = v - 1
+	}
+	fmt.Println()
+	fmt.Println("Voer alle zetten in als spatie-gescheiden tokens (pas = p / - / pass).")
+	fmt.Println("Aas+vervolg als '1/5'. Zet de resterende kaarten van de verliezer als laatste token.")
+	tokens := strings.Fields(reader.ReadLine("Zetten: "))
+	if len(tokens) == 0 {
+		fmt.Println("Geen zetten ingevoerd.")
+		return
+	}
+
+	cardsPerPlayer := make([]int, numPlayers)
+	for i := range cardsPerPlayer {
+		cardsPerPlayer[i] = 18
+	}
+	hands, _, _, err := reconstructStartingHands(numPlayers, cardsPerPlayer, startPlayer, tokens)
+	if err != nil {
+		fmt.Printf("Fout bij reconstructie: %v\n", err)
+		return
+	}
+
+	// Ontbrekende kaarten opvragen (meestal alleen de verliezer).
+	for pi, h := range hands {
+		if h.Count() >= cardsPerPlayer[pi] {
+			continue
+		}
+		need := cardsPerPlayer[pi] - h.Count()
+		fmt.Printf("\nSpeler %d mist nog %d kaart(en) die niet in de zetten stonden.\n", pi+1, need)
+		for {
+			parsed, e := reader.ReadCards(fmt.Sprintf("Resterende kaarten Speler %d (%d): ", pi+1, need))
+			if e != nil {
+				fmt.Printf("Fout: %v\n", e)
+				continue
+			}
+			if len(parsed) != need {
+				fmt.Printf("Verwacht %d, kreeg %d.\n", need, len(parsed))
+				continue
+			}
+			hands[pi] = NewHand(append(hands[pi].Cards, parsed...))
+			break
+		}
+	}
+
+	PrintHeader("Resultaat")
+	for pi, h := range hands {
+		s := handScore(h.Cards)
+		p := scorePercentile(buckets, popN, s)
+		hh := NewHand(h.Cards)
+		hh.Sort()
+		note := ""
+		if h.Count() != 18 {
+			note = fmt.Sprintf("   [!] %d kaarten i.p.v. 18", h.Count())
+		}
+		fmt.Printf("Speler %d: rating %d   (score %d, percentiel ~%.1f%%)%s\n",
+			pi+1, ratingFromP(p), s, p*100, note)
+		fmt.Printf("          %s\n", hh.String())
+	}
+}
+
+func dealFinderMode(reader *Reader, cfg settings) {
+	_ = cfg
+	PrintHeader("Kaartenset Rating")
+	fmt.Println("Rating van een hand over het volledige spectrum van mogelijke handen.")
+	fmt.Println("Lineair tot p0,2 (rating 1000), daarna verdubbelt de rating per 0,1 percentiel:")
+	fmt.Println("  p0,2->1000  p0,3->2000  p0,4->4000  p0,6->16000  p0,8->64000  top(p1,0)->256000")
+	fmt.Println()
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	var hands []scoredHand
+	if raw, err := os.ReadFile(handsFile); err == nil {
+		hands = parseHands(string(raw))
+		if len(hands) > 0 {
+			fmt.Printf("%s gevonden -- %d handen ingeladen.\n", handsFile, len(hands))
+		}
+	}
+	if len(hands) < 100 {
+		fmt.Printf("%s aanmaken (steekproef over alle mogelijke handen)...\n", handsFile)
+		hands = generatePopulation(handsSampleN, rng)
+		if err := os.WriteFile(handsFile, []byte(formatHands(hands)), 0o644); err != nil {
+			fmt.Printf("Kon %s niet schrijven: %v\n", handsFile, err)
+		} else {
+			fmt.Printf("%s geschreven -- %d handen, score %d..%d.\n",
+				handsFile, len(hands), hands[0].raw, hands[len(hands)-1].raw)
+		}
+	}
+	if len(hands) < 2 {
+		fmt.Println("Niet genoeg handen.")
+		return
+	}
+	buckets := buildScoreBuckets(hands)
+	n := len(hands)
+
+	choice := strings.ToLower(reader.ReadLine("(h) hand -> rating, (r) rating -> hand, (p) partij -> ratings? [h/r/p]: "))
+
+	if strings.HasPrefix(choice, "p") {
+		runPartijRating(reader, buckets, n)
+		return
+	}
+
+	if strings.HasPrefix(choice, "h") {
+		for {
+			line := reader.ReadLine("Voer 18 kaarten in (leeg = terug): ")
+			if strings.TrimSpace(line) == "" {
+				return
+			}
+			cards, err := ParseCards(line)
+			if err != nil {
+				fmt.Printf("Fout: %v\n", err)
+				continue
+			}
+			if len(cards) != 18 {
+				fmt.Printf("Verwacht 18 kaarten, kreeg %d.\n", len(cards))
+				continue
+			}
+			s := handScore(cards)
+			p := scorePercentile(buckets, n, s)
+			PrintHeader("Resultaat")
+			printHandRating(cards, s, p, ratingFromP(p), hands)
+			return
+		}
+	}
+
+	target := 1500
+	if v, err := reader.ReadInt(fmt.Sprintf("Gewenste rating (0-%d, standaard 1500): ", ratingMax)); err == nil && v >= 0 {
+		target = v
+	}
+	best := buckets[0]
+	for _, b := range buckets {
+		if math.Abs(float64(b.rating-target)) < math.Abs(float64(best.rating-target)) {
+			best = b
+		}
+	}
+	chosen := best.hands[rng.Intn(len(best.hands))]
+
+	PrintHeader("Resultaat")
+	fmt.Printf("Gevraagde rating : %d\n", target)
+	printHandRating(chosen.cards, chosen.raw, best.p, best.rating, hands)
+	if len(best.hands) > 1 {
+		fmt.Printf("(%d handen delen deze score/rating -- willekeurig 1 gekozen)\n", len(best.hands))
+	}
+	fmt.Printf("Verwijder %s om een nieuwe steekproef te trekken.\n", handsFile)
 }
 
 func printRanking(gs *GameState) {
