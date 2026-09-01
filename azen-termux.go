@@ -2289,6 +2289,138 @@ func findForcedWinVsOneCardResponse(gs *GameState) (*Move, int) {
 	return nil, 0
 }
 
+// distinctRankCombos enumereert alle verschillende multisets van `k` kaarten die
+// uit `pool` getrokken kunnen worden, ontdubbeld op rank (suit is irrelevant in
+// dit spel). Gebruikt om alle mogelijke tegenstanderhanden in een klein eindspel
+// af te lopen.
+func distinctRankCombos(pool []Card, k int) [][]Card {
+	counts := map[Rank]int{}
+	for _, c := range pool {
+		counts[c.Rank]++
+	}
+	ranks := make([]Rank, 0, len(counts))
+	for r := range counts {
+		ranks = append(ranks, r)
+	}
+	sort.Slice(ranks, func(i, j int) bool { return ranks[i] < ranks[j] })
+
+	var res [][]Card
+	cur := make([]Card, 0, k)
+	var rec func(idx, remaining int)
+	rec = func(idx, remaining int) {
+		if remaining == 0 {
+			combo := make([]Card, len(cur))
+			copy(combo, cur)
+			res = append(res, combo)
+			return
+		}
+		if idx >= len(ranks) {
+			return
+		}
+		r := ranks[idx]
+		maxTake := counts[r]
+		if maxTake > remaining {
+			maxTake = remaining
+		}
+		for take := 0; take <= maxTake; take++ {
+			for i := 0; i < take; i++ {
+				cur = append(cur, Card{Rank: r})
+			}
+			rec(idx+1, remaining-take)
+			cur = cur[:len(cur)-take]
+		}
+	}
+	rec(0, k)
+	return res
+}
+
+// findForcedWinEndgame2P zoekt in een 2-speler eindspel met verborgen kaarten naar
+// een zet die tegen ELKE nog mogelijke tegenstanderhand een gedwongen winst
+// oplevert. Dit vult het gat tussen findImmediateWin (alleen bij volledig bekende
+// handen) en findForcedWinVsOneCard (alleen als de tegenstander exact 1 kaart
+// heeft). Het vangt tempo-winsten die MCTS mist, bijv. {X, J, Aas} tegen 2
+// kaarten: speel eerst laag (X of J) om een hoge kaart uit de tegenstander te
+// lokken, herover de leiding met de Aas en sluit af met je laatste kaart.
+//
+// De check is strikt: een zet wordt alleen teruggegeven als forcedWinDepth voor
+// ELKE consistente tegenstanderhand een gedwongen winst vindt. Handen met een
+// nog-onzichtbare 2 (wildcard) of joker breken zo'n bewijs vanzelf — dan valt de
+// functie terug op MCTS. Er wordt dus nooit een valse "gedwongen winst" gemeld.
+func findForcedWinEndgame2P(gs *GameState, kt *KnowledgeTracker) (*Move, int) {
+	if gs == nil || kt == nil || gs.NumPlayers != 2 || gs.GameOver {
+		return nil, 0
+	}
+	pid := gs.CurrentTurn
+	oppID := 1 - pid
+	myCount := gs.Hands[pid].Count()
+	oppCount := gs.Hands[oppID].Count()
+	// Grenzen zodat volledige minimax + handenumeratie goedkoop blijft.
+	if myCount < 2 || myCount > 6 || oppCount < 1 || oppCount > 3 {
+		return nil, 0
+	}
+
+	pool := kt.PossibleOpponentCards()
+	if len(pool) < oppCount || len(pool) > 28 {
+		return nil, 0
+	}
+	cands := distinctRankCombos(pool, oppCount)
+	if len(cands) == 0 || len(cands) > 800 {
+		return nil, 0
+	}
+
+	maxDepth := (myCount + oppCount) * 4
+	const nodeBudget = 60000
+
+	moves := gs.GetLegalMoves()
+	bestDepth := -1
+	var bestMove *Move
+	for i := range moves {
+		m := moves[i]
+		if m.IsPass {
+			continue
+		}
+		worst := 0
+		forcedAll := true
+		for _, cand := range cands {
+			sim := gs.Clone()
+			sim.Hands[oppID] = NewHand(cand)
+			sim.ApplyMove(m)
+			if sim.GameOver {
+				if notLastPlace(sim, pid) {
+					if worst < 1 {
+						worst = 1
+					}
+					continue
+				}
+				forcedAll = false
+				break
+			}
+			nodes := 0
+			d := forcedWinDepth(sim, pid, maxDepth, &nodes, nodeBudget)
+			if d < 0 {
+				forcedAll = false
+				break
+			}
+			if d+1 > worst {
+				worst = d + 1
+			}
+		}
+		if !forcedAll {
+			continue
+		}
+		if bestMove == nil || worst < bestDepth ||
+			(worst == bestDepth && preferCheaperMove(m, *bestMove, gs.Round.TableRank)) {
+			bestDepth = worst
+			mv := m
+			bestMove = &mv
+		}
+	}
+	if bestMove != nil {
+		return bestMove, bestDepth
+	}
+	return nil, 0
+}
+
 // findForcedLoss detecteert of de huidige speler in een gedwongen verlies-positie zit
 // en vindt diens beste vertragingszet (de zet die het verlies het langste uitstelt).
 // Enkel van toepassing bij bekende handen (omniscient mode) en ≤12 totale kaarten.
@@ -2410,6 +2542,16 @@ func (e *Engine) BestMove(gs *GameState, kt *KnowledgeTracker) (Move, MoveEval) 
 	}
 	if win, depth := findForcedWinVsOneCardResponse(searchGS); win != nil {
 		return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
+	}
+	// Klein 2-speler eindspel met verborgen kaarten: exacte tempo-oplossing tegen
+	// alle nog mogelijke tegenstanderhanden. findImmediateWin draait hier niet
+	// (handen niet volledig bekend) en findForcedWinVsOneCard evenmin (tegenstander
+	// heeft >1 kaart). Overslaan als de handen wél bekend zijn — dan dekt
+	// findImmediateWin het al af.
+	if !knownHands {
+		if win, depth := findForcedWinEndgame2P(gs, kt); win != nil {
+			return *win, MoveEval{Score: 1.0, Visits: 1, ForcedWinDepth: depth}
+		}
 	}
 	// Filter gedomineerde wild-zetten zodat MCTS iteraties efficiënter benut worden
 	rootFiltered := filterDominatedMoves(gs.GetLegalMoves(), gs.Round)
@@ -3139,6 +3281,44 @@ func (e *Engine) smartRandom(moves []Move, gs *GameState) Move {
 					case remainingRank <= RankQueen:
 						w *= 0.60 // matig
 					}
+				}
+			}
+		}
+		// ────────────────────────────────────────────────────────────────────
+
+		// ── Tempo bij 3 losse singles in open ronde (2-speler eindspel) ──────
+		// Hand = 3 verschillende singles, open ronde, wij leiden. Speel de
+		// LAAGSTE eerst: die lokt een hoge kaart uit de tegenstander. Bewaar de
+		// HOOGSTE (boss-kaart) om de leiding te heroveren en de middelste als
+		// sluitkaart. De boss-kaart als eerste inleggen terwijl de tegenstander
+		// gewoon mag passen, verspilt je enige tempo-instrument.
+		// Voorbeeld: {X, J, Aas} vs {Q, K} → speel X (of J), niet de Aas.
+		if handCount == 3 && gs.Round.IsOpen && len(m.Cards) == 1 &&
+			wilds == 0 && resets == 0 && activePlayerCount(gs) <= 2 {
+			distinct := map[Rank]bool{}
+			for _, c := range curHand.Cards {
+				if !c.IsSpecial() {
+					distinct[c.Rank] = true
+				}
+			}
+			if len(distinct) == 3 {
+				var lo Rank = RankJoker
+				var hi Rank
+				for r := range distinct {
+					if r < lo {
+						lo = r
+					}
+					if r > hi {
+						hi = r
+					}
+				}
+				switch {
+				case effective == lo:
+					w *= 2.2 // laagste eerst → correcte tempo-opbouw
+				case effective == hi:
+					w *= 0.30 // boss-kaart eerst → tempo verspild
+				default:
+					w *= 1.1 // middelste: acceptabel
 				}
 			}
 		}
@@ -3880,7 +4060,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 17")
+		PrintHeader("AZEN Engine UPDATE 18")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
