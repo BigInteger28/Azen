@@ -307,6 +307,95 @@ func NewMultiDeck(n int) *Deck {
 	return d
 }
 
+// NewJokerlessDeck geeft één pak van 52 kaarten zónder jokers.
+func NewJokerlessDeck() *Deck {
+	d := &Deck{}
+	for _, c := range NewDeck().Cards {
+		if c.Rank == RankJoker {
+			continue
+		}
+		d.Cards = append(d.Cards, c)
+	}
+	return d
+}
+
+// ── Speldeck-configuratie per spelersaantal ──────────────────────────
+//   2-3 spelers: één volledig pak (52 + 2 jokers), 18 kaarten per speler.
+//   4 spelers:   één pak zónder jokers (52 kaarten), 13 kaarten per speler
+//                — alles wordt gedeeld, geen dode kaarten.
+
+func deckHasJokers(numPlayers int) bool { return numPlayers != 4 }
+
+func cardsPerPlayerFor(numPlayers int) int {
+	if numPlayers == 4 {
+		return 13
+	}
+	return 18
+}
+
+func gameDeck(numPlayers int) *Deck {
+	if numPlayers == 4 {
+		return NewJokerlessDeck()
+	}
+	return NewDeck()
+}
+
+// dealGuaranteedTwos deelt cardsPerPlayer kaarten per speler en garandeert dat
+// elke speler minstens één 2 (wildcard) krijgt — een spelregel. Een speler zonder
+// 2 ruilt een niet-2 tegen een overtollige 2 van een medespeler, of anders tegen
+// een 2 uit de dode kaarten.
+func dealGuaranteedTwos(d *Deck, numPlayers, cardsPerPlayer int) ([]*Hand, []Card) {
+	hands, remaining := d.Deal(numPlayers, cardsPerPlayer)
+	for p := 0; p < numPlayers; p++ {
+		if hands[p].CountRank(RankTwo) > 0 {
+			continue
+		}
+		swapped := false
+		for q := 0; q < numPlayers && !swapped; q++ {
+			if q == p || hands[q].CountRank(RankTwo) < 2 {
+				continue
+			}
+			swapped = swapTwoBetweenHands(hands[p], hands[q])
+		}
+		for i := 0; i < len(remaining) && !swapped; i++ {
+			if remaining[i].Rank != RankTwo {
+				continue
+			}
+			for j, pc := range hands[p].Cards {
+				if pc.Rank == RankTwo {
+					continue
+				}
+				remaining[i], hands[p].Cards[j] = pc, remaining[i]
+				swapped = true
+				break
+			}
+		}
+	}
+	return hands, remaining
+}
+
+// swapTwoBetweenHands verplaatst één 2 van src naar dst en geeft een niet-2 terug.
+func swapTwoBetweenHands(dst, src *Hand) bool {
+	twoIdx, otherIdx := -1, -1
+	for i, c := range src.Cards {
+		if c.Rank == RankTwo {
+			twoIdx = i
+			break
+		}
+	}
+	for i, c := range dst.Cards {
+		if c.Rank != RankTwo {
+			otherIdx = i
+			break
+		}
+	}
+	if twoIdx < 0 || otherIdx < 0 {
+		return false
+	}
+	src.Cards[twoIdx], dst.Cards[otherIdx] = dst.Cards[otherIdx], src.Cards[twoIdx]
+	return true
+}
+
 func (d *Deck) Shuffle(rng *rand.Rand) {
 	rng.Shuffle(len(d.Cards), func(i, j int) {
 		d.Cards[i], d.Cards[j] = d.Cards[j], d.Cards[i]
@@ -403,18 +492,9 @@ type GameState struct {
 }
 
 func NewGame(numPlayers int, rng *rand.Rand, startPlayer int) *GameState {
-	numDecks := 1
-	if numPlayers == 4 {
-		numDecks = 2
-	}
-	var deck *Deck
-	if numDecks == 1 {
-		deck = NewDeck()
-	} else {
-		deck = NewMultiDeck(numDecks)
-	}
+	deck := gameDeck(numPlayers)
 	deck.Shuffle(rng)
-	hands, remaining := deck.Deal(numPlayers, 18)
+	hands, remaining := dealGuaranteedTwos(deck, numPlayers, cardsPerPlayerFor(numPlayers))
 	return &GameState{
 		NumPlayers:  numPlayers,
 		Hands:       hands,
@@ -1059,8 +1139,14 @@ func NewKnowledgeTracker(numPlayers, myID int, myHand *Hand, deadCards []Card) *
 		Exclusions:     map[int]map[Rank]int{},
 	}
 	copy(kt.DeadCards, deadCards)
+	// Standaard: iedereen kreeg evenveel kaarten als jij (18 bij 2-3 spelers,
+	// 13 bij 4). Callers met exacte per-speler groottes overschrijven dit.
+	startCount := myHand.Count()
+	if startCount == 0 {
+		startCount = cardsPerPlayerFor(numPlayers)
+	}
 	for i := range kt.HandCounts {
-		kt.HandCounts[i] = 18
+		kt.HandCounts[i] = startCount
 	}
 	// Spelregel: elke speler krijgt bij de verdeling gegarandeerd minstens 1 wildcard (2).
 	// → Voeg voor elke tegenstander 1 Twee toe als zekere suspicion.
@@ -1304,20 +1390,19 @@ func (kt *KnowledgeTracker) PossibleOpponentCards() []Card {
 	for _, c := range kt.DeadCards {
 		knownCount[c.Rank]++
 	}
-	numDecks := 1
-	if kt.NumPlayers == 4 {
-		numDecks = 2
-	}
+	// Altijd één pak: 4 exemplaren per naturelle rank. Bij 4 spelers zonder jokers.
 	normalRanks := []Rank{
 		RankThree, RankFour, RankFive, RankSix, RankSeven,
 		RankEight, RankNine, RankTen, RankJack, RankQueen, RankKing,
-		RankAce, RankTwo, // beide aanwezig in 4 exemplaren per deck
+		RankAce, RankTwo,
 	}
 	totalCount := map[Rank]int{}
 	for _, r := range normalRanks {
-		totalCount[r] = 4 * numDecks
+		totalCount[r] = 4
 	}
-	totalCount[RankJoker] = 2 * numDecks
+	if deckHasJokers(kt.NumPlayers) {
+		totalCount[RankJoker] = 2
+	}
 	var possible []Card
 	allRanks := append(normalRanks, RankJoker)
 	for _, r := range allRanks {
@@ -4312,7 +4397,7 @@ func main() {
 	reader := NewReader()
 	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 20")
+		PrintHeader("AZEN Engine UPDATE 21")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
@@ -4582,9 +4667,10 @@ func playMode(reader *Reader, cfg settings) {
 	}
 	hands := make([]*Hand, numPlayers)
 	cardCounts := make([]int, numPlayers)
+	dfltCards := cardsPerPlayerFor(numPlayers)
 	for i := 0; i < numPlayers; i++ {
-		cardCounts[i] = 18
-		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
+		cardCounts[i] = dfltCards
+		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten voor Speler %d (standaard %d): ", i+1, dfltCards)); err == nil && n > 0 {
 			cardCounts[i] = n
 		}
 		if i == myPlayer {
@@ -4621,9 +4707,12 @@ func playMode(reader *Reader, cfg settings) {
 	}
 	var deadCards []Card
 	if numPlayers == 2 {
-		fmt.Println("\nMet 2 spelers zijn 18 kaarten niet in spel (engine houdt hiermee rekening).")
+		fmt.Printf("\nMet 2 spelers zijn %d kaarten niet in spel (engine houdt hiermee rekening).\n", 54-2*dfltCards)
 	}
 	tracker := NewKnowledgeTracker(numPlayers, myPlayer, hands[myPlayer], deadCards)
+	for i := 0; i < numPlayers; i++ {
+		tracker.HandCounts[i] = cardCounts[i]
+	}
 	gs := NewGameWithHands(hands, deadCards, 0)
 	engConfig := DefaultConfig(numPlayers)
 	engConfig.MinIterations = cfg.minIters
@@ -4809,10 +4898,14 @@ func playMode(reader *Reader, cfg settings) {
 	printRanking(gs)
 }
 
-// perfectMove2P kiest de perfecte zet in een volledig bekende 2-speler stelling:
-// als de speler-aan-zet wint, de snelste winst; verliest hij, de langste
-// weerstand. Retourneert (zet, beschrijving, opgelost).
-func perfectMove2P(gs *GameState) (Move, string, bool) {
+// perfectMove2P kiest de zet in een volledig bekende 2-speler stelling.
+//   - Winnend: de exact snelste gedwongen winst (echt perfect spel).
+//   - Verliezend: game-theoretisch is elke zet verloren, dus we spelen NIET het
+//     saai-langste (dat is vaak passen), maar de praktisch beste zet — die de
+//     tegenstander de meeste kansen geeft om te blunderen. Daarvoor gebruiken we
+//     de omniscient-MCTS: rollouts bevatten imperfect spel, dus die kiest
+//     actieve, lastige zetten in plaats van te passen.
+func perfectMove2P(gs *GameState, eng *Engine, kt *KnowledgeTracker) (Move, string, bool) {
 	if gs.NumPlayers != 2 || gs.GameOver {
 		return Move{}, "", false
 	}
@@ -4825,71 +4918,115 @@ func perfectMove2P(gs *GameState) (Move, string, bool) {
 	}
 	nodes := 0
 	v, ok := ttBit(gs, solveBitTT, &nodes, solveNodeBudget)
-	if !ok {
-		return Move{}, "", false
+
+	mctsDesc := func(ev MoveEval) string {
+		if ev.ForcedWinDepth > 0 {
+			return fmt.Sprintf("gedwongen winst in %d beurt(en)", ev.ForcedWinDepth)
+		}
+		return "winst-inschatting " + FormatScore(ev.Score)
 	}
+
+	if !ok {
+		bm, ev := eng.BestMove(gs, kt)
+		return bm, mctsDesc(ev), true
+	}
+
 	totalCards := 0
 	for _, h := range gs.Hands {
 		totalCards += h.Count()
 	}
-	withDist := totalCards <= 26 // exacte afstand alleen voor kleinere stellingen
-
 	moves := gs.GetLegalMoves()
-	var best *Move
-	bestDist := -1
-	dn := 0
-	for i := range moves {
-		m := moves[i]
-		sim := gs.Clone()
-		sim.ApplyMove(m)
-		cw, over, ok2 := childOutcome(gs, pid, sim, solveBitTT, &nodes, solveNodeBudget)
-		if !ok2 || cw != v {
-			continue // alleen zetten die het verdict behouden
-		}
-		d := 1
-		if !over && withDist {
-			if dd, ok3 := ttDistExact(sim, solveBitTT, solveDistTT, &dn, solveDistBudget); ok3 {
-				d = dd + 1
-			} else {
-				d = 1 << 20 // afstand onbekend
+
+	if v == 1 {
+		// WINNEND — de winst moet omgezet worden. Exact snelste winst wanneer de
+		// stelling klein genoeg is, anders de MCTS-voorkeur (die converteert ook).
+		if totalCards <= 26 {
+			var best *Move
+			bestD := 1 << 30
+			dn := 0
+			for i := range moves {
+				m := moves[i]
+				sim := gs.Clone()
+				sim.ApplyMove(m)
+				cw, over, ok2 := childOutcome(gs, pid, sim, solveBitTT, &nodes, solveNodeBudget)
+				if !ok2 || cw != 1 {
+					continue // alleen winst-behoudende zetten
+				}
+				d := 1
+				if !over {
+					if dd, ok3 := ttDistExact(sim, solveBitTT, solveDistTT, &dn, solveDistBudget); ok3 {
+						d = dd + 1
+					} else {
+						d = 1 << 20
+					}
+				}
+				if best == nil || d < bestD || (d == bestD && best.IsPass && !m.IsPass) {
+					bestD = d
+					mm := m
+					best = &mm
+				}
 			}
-		} else if !over {
-			d = 1 << 20 // niet berekend
-		}
-		better := best == nil
-		if !better {
-			if v == 1 {
-				better = d < bestDist // winnen: snelst
-			} else {
-				better = d > bestDist // verliezen: langst
+			if best != nil {
+				if bestD >= 1 && bestD < (1<<20) {
+					return *best, fmt.Sprintf("gedwongen winst in %d zetten", bestD), true
+				}
+				return *best, "gedwongen winst", true
 			}
 		}
-		if better {
-			bestDist = d
-			mm := m
-			best = &mm
+		bm, ev := eng.BestMove(gs, kt)
+		return bm, "gedwongen winst — " + mctsDesc(ev), true
+	}
+
+	// VERLIEZEND — game-theoretisch verloren. Speel de zet die het langst rekt
+	// (= meeste beurten waarin de tegenstander nog kan blunderen), met de
+	// MCTS-voorkeur als tiebreak bij bijna-gelijke afstand. Nooit passen tenzij
+	// het de enige zet is.
+	bm, _ := eng.BestMove(gs, kt)
+	if totalCards <= 26 {
+		maxD := -1
+		var maxMove *Move
+		bmDist := -1
+		for i := range moves {
+			m := moves[i]
+			if m.IsPass && len(moves) > 1 {
+				continue
+			}
+			d := distAfterMove2P(gs, m, solveBitTT, solveDistTT)
+			if d < 1 {
+				continue // -1 (ontsnapt, kan niet) of -2 (onbekend)
+			}
+			if d > maxD {
+				maxD = d
+				mm := m
+				maxMove = &mm
+			}
+			if MovesEqual(m, bm) {
+				bmDist = d
+			}
+		}
+		if maxMove != nil {
+			if bmDist >= 1 && bmDist >= maxD-2 {
+				return bm, fmt.Sprintf("gedwongen verlies in %d zetten — praktisch sterkste (op tegenfout)", bmDist), true
+			}
+			return *maxMove, fmt.Sprintf("gedwongen verlies in %d zetten — langste weerstand", maxD), true
 		}
 	}
-	if best == nil {
-		if len(moves) == 0 {
-			return Move{}, "", false
+	// Grote stelling: geen exacte afstand. MCTS-zet, maar nooit passen als er een
+	// actieve verliezend-blijvende zet is.
+	if bm.IsPass {
+		for _, m := range moves {
+			if m.IsPass {
+				continue
+			}
+			sim := gs.Clone()
+			sim.ApplyMove(m)
+			if cw, _, ok2 := childOutcome(gs, pid, sim, solveBitTT, &nodes, solveNodeBudget); ok2 && cw == 0 {
+				bm = m
+				break
+			}
 		}
-		mm := moves[0]
-		best = &mm
 	}
-	var desc string
-	known := bestDist >= 1 && bestDist < (1<<20)
-	switch {
-	case v == 1 && known:
-		desc = fmt.Sprintf("gedwongen winst in %d zetten", bestDist)
-	case v == 1:
-		desc = "gedwongen winst"
-	case known:
-		desc = fmt.Sprintf("gedwongen verlies in %d zetten (langste weerstand)", bestDist)
-	default:
-		desc = "gedwongen verlies (schaakmat)"
-	}
-	return *best, desc, true
+	return bm, "gedwongen verlies (schaakmat) — beste praktische weerstand", true
 }
 
 // perfectMode: spelen met volledige informatie. Je voert alle handen in (bij 3
@@ -4908,15 +5045,15 @@ func perfectMode(reader *Reader, cfg settings) {
 	if p, err := reader.ReadInt(fmt.Sprintf("Jouw spelernummer (1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
 		myPlayer = p - 1
 	}
-	cardsPer := 18
-	if n, err := reader.ReadInt("Kaarten per speler (standaard 18): "); err == nil && n > 0 {
+	cardsPer := cardsPerPlayerFor(numPlayers)
+	if n, err := reader.ReadInt(fmt.Sprintf("Kaarten per speler (standaard %d): ", cardsPer)); err == nil && n > 0 {
 		cardsPer = n
 	}
 
-	// Hoeveel handen invoeren? Bij 3 spelers (1 deck, alles gedeeld) leiden we de
-	// laatste af; anders alle handen.
+	// Hoeveel handen invoeren? Bij 3 of 4 spelers (1 pak, alles gedeeld) leiden we
+	// de laatste hand af; anders alle handen.
 	toEnter := numPlayers
-	deduceLast := numPlayers == 3
+	deduceLast := numPlayers == 3 || numPlayers == 4
 	if deduceLast {
 		toEnter = numPlayers - 1
 	}
@@ -4954,12 +5091,7 @@ func perfectMode(reader *Reader, cfg settings) {
 	}
 
 	// Deck bepalen en resterende / afgeleide hand.
-	var deck []Card
-	if numPlayers == 4 {
-		deck = NewMultiDeck(2).Cards
-	} else {
-		deck = NewDeck().Cards
-	}
+	deck := gameDeck(numPlayers).Cards
 	rem := map[Rank]int{}
 	for _, c := range deck {
 		rem[c.Rank]++
@@ -5030,12 +5162,13 @@ func perfectMode(reader *Reader, cfg settings) {
 	// bestMove voor de menselijke speler cachen zodat 'perfMove' hieronder de
 	// perfecte zet toont/gebruikt.
 	perfMove := func() (Move, string) {
+		kt := trackers[gs.CurrentTurn]
 		if numPlayers == 2 {
-			if mv, desc, ok := perfectMove2P(gs); ok {
+			if mv, desc, ok := perfectMove2P(gs, eng, kt); ok {
 				return mv, desc
 			}
 		}
-		bm, ev := eng.BestMove(gs, trackers[gs.CurrentTurn])
+		bm, ev := eng.BestMove(gs, kt)
 		if ev.ForcedWinDepth > 0 {
 			return bm, fmt.Sprintf("gedwongen winst in %d beurt(en)", ev.ForcedWinDepth)
 		}
@@ -5212,9 +5345,10 @@ func analyzeMode(reader *Reader, cfg settings) {
 
 	// Startkaarten per speler (alleen aantallen)
 	cardsPerPlayer := make([]int, numPlayers)
+	dfltCards := cardsPerPlayerFor(numPlayers)
 	for i := 0; i < numPlayers; i++ {
-		cardsPerPlayer[i] = 18
-		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten Speler %d (standaard 18): ", i+1)); err == nil && n > 0 {
+		cardsPerPlayer[i] = dfltCards
+		if n, err := reader.ReadInt(fmt.Sprintf("Aantal startkaarten Speler %d (standaard %d): ", i+1, dfltCards)); err == nil && n > 0 {
 			cardsPerPlayer[i] = n
 		}
 	}
@@ -5807,16 +5941,7 @@ func reconstructStartingHands(numPlayers int, cardsPerPlayer []int, startPlayer 
 	}
 
 	// Dode kaarten = volledig deck minus alle starthanden
-	numDecks := 1
-	if numPlayers == 4 {
-		numDecks = 2
-	}
-	var allDeckCards []Card
-	if numDecks == 1 {
-		allDeckCards = NewDeck().Cards
-	} else {
-		allDeckCards = NewMultiDeck(2).Cards
-	}
+	allDeckCards := gameDeck(numPlayers).Cards
 	used := make(map[Card]int)
 	for _, h := range hands {
 		for _, c := range h.Cards {
@@ -6375,7 +6500,7 @@ func runPartijRating(reader *Reader, buckets []scoreBucket, popN int) {
 
 	cardsPerPlayer := make([]int, numPlayers)
 	for i := range cardsPerPlayer {
-		cardsPerPlayer[i] = 18
+		cardsPerPlayer[i] = cardsPerPlayerFor(numPlayers)
 	}
 	hands, _, _, err := reconstructStartingHands(numPlayers, cardsPerPlayer, startPlayer, tokens)
 	if err != nil {
@@ -6412,8 +6537,8 @@ func runPartijRating(reader *Reader, buckets []scoreBucket, popN int) {
 		hh := NewHand(h.Cards)
 		hh.Sort()
 		note := ""
-		if h.Count() != 18 {
-			note = fmt.Sprintf("   [!] %d kaarten i.p.v. 18", h.Count())
+		if want := cardsPerPlayerFor(numPlayers); h.Count() != want {
+			note = fmt.Sprintf("   [!] %d kaarten i.p.v. %d", h.Count(), want)
 		}
 		fmt.Printf("Speler %d: rating %d   (score %d, percentiel ~%.1f%%)%s\n",
 			pi+1, ratingFromP(p), s, p*100, note)
