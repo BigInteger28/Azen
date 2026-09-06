@@ -341,21 +341,30 @@ func gameDeck(numPlayers int) *Deck {
 }
 
 // dealGuaranteedTwos deelt cardsPerPlayer kaarten per speler en garandeert dat
-// elke speler minstens één 2 (wildcard) krijgt — een spelregel. Een speler zonder
-// 2 ruilt een niet-2 tegen een overtollige 2 van een medespeler, of anders tegen
-// een 2 uit de dode kaarten.
+// elke speler minstens één 2 (wildcard) krijgt — een spelregel.
 func dealGuaranteedTwos(d *Deck, numPlayers, cardsPerPlayer int) ([]*Hand, []Card) {
 	hands, remaining := d.Deal(numPlayers, cardsPerPlayer)
-	for p := 0; p < numPlayers; p++ {
-		if hands[p].CountRank(RankTwo) > 0 {
+	ensureEachHandHasTwo(hands, nil, remaining)
+	return hands, remaining
+}
+
+// ensureEachHandHasTwo garandeert dat elke hand (behalve stoelen waarvoor
+// skip[seat] geldt) minstens één 2 heeft. Een hand zonder 2 ruilt een niet-2
+// tegen een overtollige 2 van een andere hand, of tegen een 2 uit `remaining`.
+func ensureEachHandHasTwo(hands []*Hand, skip map[int]bool, remaining []Card) {
+	for p := range hands {
+		if skip[p] || hands[p] == nil || hands[p].CountRank(RankTwo) > 0 {
 			continue
 		}
 		swapped := false
-		for q := 0; q < numPlayers && !swapped; q++ {
-			if q == p || hands[q].CountRank(RankTwo) < 2 {
+		for q := range hands {
+			if q == p || skip[q] || hands[q] == nil || hands[q].CountRank(RankTwo) < 2 {
 				continue
 			}
-			swapped = swapTwoBetweenHands(hands[p], hands[q])
+			if swapTwoBetweenHands(hands[p], hands[q]) {
+				swapped = true
+				break
+			}
 		}
 		for i := 0; i < len(remaining) && !swapped; i++ {
 			if remaining[i].Rank != RankTwo {
@@ -371,7 +380,6 @@ func dealGuaranteedTwos(d *Deck, numPlayers, cardsPerPlayer int) ([]*Hand, []Car
 			}
 		}
 	}
-	return hands, remaining
 }
 
 // swapTwoBetweenHands verplaatst één 2 van src naar dst en geeft een niet-2 terug.
@@ -4395,20 +4403,21 @@ type settings struct {
 
 func main() {
 	reader := NewReader()
-	cfg := settings{numThreads: 8, minIters: 20000, maxIters: 200000, thinkMs: 2000}
+	cfg := settings{numThreads: 16, minIters: 50000, maxIters: 1000000, thinkMs: 5000}
 	for {
-		PrintHeader("AZEN Engine UPDATE 21")
+		PrintHeader("AZEN Engine UPDATE 22")
 		fmt.Println("Welkom bij de AZEN kaartspel engine!")
 		fmt.Println()
 		fmt.Printf("  [0] Instellingen  (threads: %d | iter: %d–%d | %dms)\n", cfg.numThreads, cfg.minIters, cfg.maxIters, cfg.thinkMs)
 		fmt.Println("  [1] Spelen  - Engine suggereert zetten voor jou (verborgen tegenstander)")
-		fmt.Println("  [2] Perfect - Spelen met alle handen bekend; engine speelt perfect")
-		fmt.Println("  [3] Analyse - Analyseer een gespeelde partij")
-		fmt.Println("  [4] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
-		fmt.Println("  [5] Kaartenset - Rating van een hand / hand voor een rating / partij-ratings")
+		fmt.Println("  [2] Tegen computer - Jij speelt, de computer speelt de andere spelers")
+		fmt.Println("  [3] Perfect - Spelen met alle handen bekend; engine speelt perfect")
+		fmt.Println("  [4] Analyse - Analyseer een gespeelde partij")
+		fmt.Println("  [5] Simuleer - Kijk hoe de engine tegen zichzelf speelt")
+		fmt.Println("  [6] Kaartenset - Rating van een hand / hand voor een rating / partij-ratings")
 		fmt.Println("  [q] Afsluiten")
 		fmt.Println()
-		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4/5, q=stop): ")
+		modeStr := reader.ReadLine("Kies modus (0/1/2/3/4/5/6, q=stop): ")
 		if reader.eof {
 			return
 		}
@@ -4424,15 +4433,17 @@ func main() {
 		case 1:
 			playMode(reader, cfg)
 		case 2:
-			perfectMode(reader, cfg)
+			vsComputerMode(reader, cfg)
 		case 3:
-			analyzeMode(reader, cfg)
+			perfectMode(reader, cfg)
 		case 4:
-			simulateMode(reader, cfg)
+			analyzeMode(reader, cfg)
 		case 5:
+			simulateMode(reader, cfg)
+		case 6:
 			dealFinderMode(reader, cfg)
 		default:
-			fmt.Println("Onbekende keuze — kies 0, 1, 2, 3, 4, 5 of q.")
+			fmt.Println("Onbekende keuze — kies 0, 1, 2, 3, 4, 5, 6 of q.")
 			continue
 		}
 		if reader.eof {
@@ -5027,6 +5038,185 @@ func perfectMove2P(gs *GameState, eng *Engine, kt *KnowledgeTracker) (Move, stri
 		}
 	}
 	return bm, "gedwongen verlies (schaakmat) — beste praktische weerstand", true
+}
+
+// vsComputerMode: jij speelt één stoel, de computer speelt alle andere spelers.
+// Je voert je eigen hand in of krijgt willekeurige kaarten. De computer kent het
+// hele spel (ook jouw kaarten, zoals gevraagd) en speelt de tegenstanders zo
+// sterk mogelijk; het niveau volgt de instellingen uit optie 0.
+func vsComputerMode(reader *Reader, cfg settings) {
+	PrintHeader("Speel tegen de computer")
+	fmt.Println("Jij speelt één stoel; de computer speelt de andere spelers.")
+	fmt.Println("De computer kent alle handen (ook die van jou).")
+	fmt.Println()
+
+	numPlayers := 2
+	if n, err := reader.ReadInt("Aantal spelers (2/3/4): "); err == nil && n >= 2 && n <= 4 {
+		numPlayers = n
+	}
+	cpp := cardsPerPlayerFor(numPlayers)
+
+	myPlayer := 0
+	if p, err := reader.ReadInt(fmt.Sprintf("Jouw spelernummer (1-%d): ", numPlayers)); err == nil && p >= 1 && p <= numPlayers {
+		myPlayer = p - 1
+	}
+
+	ownCards := reader.ReadYesNo("Wil je je eigen kaarten invoeren? (nee = willekeurige kaarten)")
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	hands := make([]*Hand, numPlayers)
+	var deadCards []Card
+
+	if ownCards {
+		var myHand *Hand
+		for !reader.eof {
+			input := reader.ReadLine(fmt.Sprintf("Jouw %d kaarten (of 'help'): ", cpp))
+			if strings.ToLower(strings.TrimSpace(input)) == "help" {
+				PrintHelp()
+				continue
+			}
+			parsed, err := ParseCards(input)
+			if err != nil {
+				fmt.Printf("Fout: %v\n", err)
+				continue
+			}
+			if len(parsed) != cpp {
+				fmt.Printf("Verwacht %d kaarten, kreeg %d.\n", cpp, len(parsed))
+				continue
+			}
+			myHand = NewHand(parsed)
+			break
+		}
+		if myHand == nil {
+			return
+		}
+		// Rest van het pak willekeurig over de andere stoelen, met 2-garantie.
+		rem := map[Rank]int{}
+		for _, c := range gameDeck(numPlayers).Cards {
+			rem[c.Rank]++
+		}
+		for _, c := range myHand.Cards {
+			rem[c.Rank]--
+			if rem[c.Rank] < 0 {
+				fmt.Println("⚠️  Die hand past niet in één pak — controleer je kaarten.")
+				return
+			}
+		}
+		var pool []Card
+		for r, n := range rem {
+			for k := 0; k < n; k++ {
+				pool = append(pool, Card{Rank: r})
+			}
+		}
+		rng.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
+		hands[myPlayer] = myHand
+		idx := 0
+		for p := 0; p < numPlayers; p++ {
+			if p == myPlayer {
+				continue
+			}
+			h := &Hand{}
+			for k := 0; k < cpp && idx < len(pool); k++ {
+				h.Cards = append(h.Cards, pool[idx])
+				idx++
+			}
+			hands[p] = h
+		}
+		deadCards = append(deadCards, pool[idx:]...)
+		ensureEachHandHasTwo(hands, map[int]bool{myPlayer: true}, deadCards)
+	} else {
+		deck := gameDeck(numPlayers)
+		deck.Shuffle(rng)
+		dealt, dead := dealGuaranteedTwos(deck, numPlayers, cpp)
+		copy(hands, dealt)
+		deadCards = dead
+	}
+
+	gs := NewGameWithHands(hands, deadCards, 0)
+	engConfig := DefaultConfig(numPlayers)
+	engConfig.OmniscientMode = true
+	engConfig.MinIterations = cfg.minIters
+	engConfig.Iterations = cfg.maxIters
+	engConfig.MaxTime = time.Duration(cfg.thinkMs) * time.Millisecond
+	engConfig.NumWorkers = cfg.numThreads
+	eng := NewEngine(engConfig)
+
+	trackers := make([]*KnowledgeTracker, numPlayers)
+	for p := 0; p < numPlayers; p++ {
+		trackers[p] = NewKnowledgeTracker(numPlayers, p, gs.Hands[p], gs.DeadCards)
+		for q := 0; q < numPlayers; q++ {
+			trackers[p].HandCounts[q] = gs.Hands[q].Count()
+		}
+	}
+	if numPlayers == 2 {
+		solveBitTT = make(map[uint64]int8, 1<<21)
+		solveDistTT = make(map[uint64]int32, 1<<21)
+		defer func() { solveBitTT, solveDistTT = nil, nil }()
+	}
+
+	startStr := reader.ReadLine("Wie begint? (spelernummer of 'ik'): ")
+	if s := strings.ToLower(strings.TrimSpace(startStr)); s == "ik" || s == "me" {
+		gs.CurrentTurn = myPlayer
+	} else if p, err := strconv.Atoi(strings.TrimSpace(startStr)); err == nil && p >= 1 && p <= numPlayers {
+		gs.CurrentTurn = p - 1
+	}
+
+	wantHints := reader.ReadYesNo("Hints tonen tijdens jouw beurt?")
+
+	computerMove := func() (Move, string) {
+		kt := trackers[gs.CurrentTurn]
+		if numPlayers == 2 {
+			if mv, desc, ok := perfectMove2P(gs, eng, kt); ok {
+				return mv, desc
+			}
+		}
+		bm, ev := eng.BestMove(gs, kt)
+		if ev.ForcedWinDepth > 0 {
+			return bm, fmt.Sprintf("gedwongen winst in %d beurt(en)", ev.ForcedWinDepth)
+		}
+		return bm, fmt.Sprintf("inschatting %s", FormatScore(ev.Score))
+	}
+
+	fmt.Printf("\n🎮 Spel gestart! Jij bent Speler %d.\n\n", myPlayer+1)
+	for !gs.GameOver {
+		printGameStatus(gs, trackers[myPlayer], myPlayer)
+		turn := gs.CurrentTurn
+		legal := gs.GetLegalMoves()
+		forcedPass := len(legal) == 1 && legal[0].IsPass
+
+		if turn == myPlayer {
+			PrintSubHeader("Jouw beurt")
+			PrintCards(gs.Hands[myPlayer])
+			if forcedPass {
+				fmt.Println("\n⏩ Geen speelbare kaarten — automatisch pas.")
+				applyRec(gs, trackers, PassMove(myPlayer))
+				continue
+			}
+			suggestion := ""
+			if wantHints {
+				fmt.Println("\n🤔 Denkt na over een hint...")
+				hm, desc := computerMove()
+				suggestion = fmt.Sprintf("Tip: %s (%s)", FormatMove(hm), desc)
+				fmt.Printf("💡 %s\n\n", suggestion)
+			}
+			if readAndApplySeatMove(reader, gs, trackers, myPlayer, myPlayer, suggestion) {
+				return
+			}
+			continue
+		}
+
+		PrintSubHeader(fmt.Sprintf("Beurt van Speler %d (computer)", turn+1))
+		if forcedPass {
+			fmt.Println("⏩ Geen speelbare kaarten — automatisch pas.")
+			applyRec(gs, trackers, PassMove(turn))
+			continue
+		}
+		cm, desc := computerMove()
+		fmt.Printf("🤖 Speler %d speelt: %s   (%s)\n\n", turn+1, FormatMove(cm), desc)
+		applyRec(gs, trackers, cm)
+	}
+	PrintHeader("Spel Voorbij!")
+	printRanking(gs)
 }
 
 // perfectMode: spelen met volledige informatie. Je voert alle handen in (bij 3
@@ -5707,6 +5897,7 @@ func analyzeMode(reader *Reader, cfg settings) {
 		printRanking(gs)
 	} else {
 		fmt.Printf("Partij gestopt na %d zetten (spel nog niet voorbij).\n", moveNum)
+		printGameLine(gs)
 	}
 	if firstSchaakmatMove == 1 {
 		fmt.Println("\n⛔ De geanalyseerde speler stond al bij de verdeling verloren — geen enkele zet kon het schaakmat vermijden.")
@@ -6648,6 +6839,41 @@ func printRanking(gs *GameState) {
 		}
 		fmt.Printf("%s Speler %d %s\n", m, pid+1, lbl)
 	}
+	printGameLine(gs)
+}
+
+// printGameLine toont de hele partij op één regel: zetten spatie-gescheiden,
+// kaarten binnen een zet aaneengesloten, pas = '-', reset-vervolg met '/'.
+// Bijvoorbeeld: "777 - 3 66 88 3330/44 -"
+func printGameLine(gs *GameState) {
+	if len(gs.History) == 0 {
+		return
+	}
+	var tokens []string
+	prevPID := -1
+	prevPass := true
+	for _, m := range gs.History {
+		if m.IsPass {
+			tokens = append(tokens, "-")
+			prevPID, prevPass = m.PlayerID, true
+			continue
+		}
+		sorted := make([]Card, len(m.Cards))
+		copy(sorted, m.Cards)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Rank < sorted[j].Rank })
+		var b strings.Builder
+		for _, c := range sorted {
+			b.WriteString(c.String())
+		}
+		tok := b.String()
+		if m.PlayerID == prevPID && !prevPass && len(tokens) > 0 {
+			tokens[len(tokens)-1] += "/" + tok // reset-vervolg in dezelfde beurt
+		} else {
+			tokens = append(tokens, tok)
+		}
+		prevPID, prevPass = m.PlayerID, false
+	}
+	fmt.Printf("\nPartij: %s\n", strings.Join(tokens, " "))
 }
 
 var _ = SaveGame
